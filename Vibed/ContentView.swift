@@ -99,7 +99,7 @@ struct ContentView: View {
                 scheduleOverlayHide()
                 scheduleHintDismiss()
             }
-            .onChange(of: store.vibes.count) { newCount in
+            .onChange(of: store.vibes.count) { oldCount, newCount in
                 // A new vibe was published — jump to it and close editor
                 let newIndex = newCount - 1
                 currentIndex   = newIndex

@@ -2,7 +2,7 @@
 
 import Foundation
 
-struct Vibe: Identifiable {
+struct Vibe: Identifiable, Codable {
     let id: UUID
     let title: String
     let description: String
