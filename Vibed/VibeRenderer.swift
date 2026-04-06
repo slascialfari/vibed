@@ -10,23 +10,19 @@ import CoreHaptics
 struct VibeRenderer: UIViewRepresentable {
     let vibe: Vibe
 
-    /// Called continuously during a two-finger drag with the cumulative Y translation.
-    var onDragChanged: (CGFloat) -> Void = { _ in }
-    /// Called when a two-finger drag ends, with the Y velocity.
-    var onDragEnded: (CGFloat) -> Void = { _ in }
+    /// When false, no two-finger navigation gesture is added and multi-touch
+    /// is not blocked in JS — so the Vibe itself owns all touch input.
+    var enableNavigationGesture: Bool = true
+
+    /// Called once when a two-finger drag begins.
+    var onDragBegan: () -> Void = { }
+    /// Called continuously during a two-finger drag with the cumulative X/Y translation.
+    var onDragChanged: (CGPoint) -> Void = { _ in }
+    /// Called when a two-finger drag ends, with the X/Y velocity.
+    var onDragEnded: (CGPoint) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    // Returns a plain UIView CONTAINER (not the WKWebView directly).
-    //
-    // Why this matters for gesture recognition:
-    //   UIKit gesture recognizers on a view receive touches destined for that
-    //   view AND all of its DESCENDANTS — regardless of which subview hitTest
-    //   returns. WKWebView has a deep internal hierarchy (WKScrollView →
-    //   WKContentView → ...) whose own gesture recognizers intercept touches
-    //   before a recognizer placed on WKWebView itself can see them.
-    //   By placing the two-finger pan on a plain UIView PARENT of WKWebView,
-    //   both fingers land in our recognizer with no internal competition.
     func makeUIView(context: Context) -> UIView {
         let config = WKWebViewConfiguration()
 
@@ -38,7 +34,7 @@ struct VibeRenderer: UIViewRepresentable {
 
         // ── JS bridge ────────────────────────────────────────────────────────
         config.userContentController.addUserScript(
-            WKUserScript(source: vibedBridgeJS,
+            WKUserScript(source: makeBridgeJS(blockMultiTouch: enableNavigationGesture),
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true)
         )
@@ -70,31 +66,29 @@ struct VibeRenderer: UIViewRepresentable {
         ])
 
         // ── Two-finger navigation gesture on the CONTAINER ───────────────────
-        // minimumNumberOfTouches = 2 → single-finger touches FAIL this
-        // recognizer immediately and are delivered to WKWebView untouched.
-        // cancelsTouchesInView = true → once .began fires, web content gets
-        // touchesCancelled so the Vibe never handles the navigation swipe.
-        let pan = UIPanGestureRecognizer(
-            target: context.coordinator,
-            action: #selector(Coordinator.handlePan(_:))
-        )
-        pan.minimumNumberOfTouches = 2
-        pan.maximumNumberOfTouches = 2
-        pan.cancelsTouchesInView = true
-        pan.delegate = context.coordinator
-        container.addGestureRecognizer(pan)
+        if enableNavigationGesture {
+            let pan = UIPanGestureRecognizer(
+                target: context.coordinator,
+                action: #selector(Coordinator.handlePan(_:))
+            )
+            pan.minimumNumberOfTouches = 2
+            pan.maximumNumberOfTouches = 2
+            pan.cancelsTouchesInView = true
+            pan.delegate = context.coordinator
+            container.addGestureRecognizer(pan)
+        }
 
+        context.coordinator.onDragBegan   = onDragBegan
         context.coordinator.onDragChanged = onDragChanged
-        context.coordinator.onDragEnded = onDragEnded
+        context.coordinator.onDragEnded   = onDragEnded
         context.coordinator.attach(to: wv)
         return container
     }
 
     func updateUIView(_ container: UIView, context: Context) {
-        // Closures capture @State bindings; SwiftUI may produce new instances
-        // each render cycle, so always sync the latest versions.
+        context.coordinator.onDragBegan   = onDragBegan
         context.coordinator.onDragChanged = onDragChanged
-        context.coordinator.onDragEnded = onDragEnded
+        context.coordinator.onDragEnded   = onDragEnded
 
         guard context.coordinator.loadedVibeID != vibe.id else { return }
         context.coordinator.loadedVibeID = vibe.id
@@ -119,8 +113,9 @@ final class Coordinator: NSObject,
     var loadedVibeID: UUID?
     private(set) weak var webView: WKWebView?
 
-    var onDragChanged: (CGFloat) -> Void = { _ in }
-    var onDragEnded:   (CGFloat) -> Void = { _ in }
+    var onDragBegan:   () -> Void        = { }
+    var onDragChanged: (CGPoint) -> Void = { _ in }
+    var onDragEnded:   (CGPoint) -> Void = { _ in }
 
     private let motion = CMMotionManager()
 
@@ -133,26 +128,26 @@ final class Coordinator: NSObject,
 
     @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
         switch recognizer.state {
-        case .began, .changed:
-            // translation(in:) is cumulative from gesture start — use directly
-            // as the dragOffset for ContentView's layout math.
-            onDragChanged(recognizer.translation(in: recognizer.view).y)
+        case .began:
+            onDragBegan()
+            let t = recognizer.translation(in: recognizer.view)
+            onDragChanged(CGPoint(x: t.x, y: t.y))
+        case .changed:
+            let t = recognizer.translation(in: recognizer.view)
+            onDragChanged(CGPoint(x: t.x, y: t.y))
         case .ended, .cancelled, .failed:
-            onDragEnded(recognizer.velocity(in: recognizer.view).y)
+            let v = recognizer.velocity(in: recognizer.view)
+            onDragEnded(CGPoint(x: v.x, y: v.y))
         default:
             break
         }
     }
 
-    // Allow simultaneous recognition with any WKWebView-internal recognizers;
-    // cancelsTouchesInView=true on our pan is what ultimately stops web content
-    // from processing these touches once we begin.
     func gestureRecognizer(
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
     ) -> Bool { true }
 
-    // Never require another recognizer to fail before we can begin.
     func gestureRecognizer(
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRequireFailureOf other: UIGestureRecognizer
@@ -300,21 +295,24 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 
 // MARK: - JS Bridge
 
-private let vibedBridgeJS = """
-(function () {
-  'use strict';
+private func makeBridgeJS(blockMultiTouch: Bool) -> String {
+    let blockSection = blockMultiTouch ? """
 
   // ── Two-finger touch block ─────────────────────────────────────────────────
   // Feed navigation owns all two-finger gestures. Block them in the capture
-  // phase before any Vibe script sees them. The native UIPanGestureRecognizer
-  // with cancelsTouchesInView=true covers the UIKit layer in parallel.
+  // phase before any Vibe script sees them.
   var _blockMulti = function (e) {
     if (e.touches.length > 1) { e.stopPropagation(); e.preventDefault(); }
   };
   document.addEventListener('touchstart', _blockMulti, { capture: true, passive: false });
   document.addEventListener('touchmove',  _blockMulti, { capture: true, passive: false });
 
-  // ── Motion / orientation event bridge ─────────────────────────────────────
+""" : "\n"
+
+    return """
+(function () {
+  'use strict';
+\(blockSection)  // ── Motion / orientation event bridge ─────────────────────────────────────
   var _motionListeners = [];
   var _orientListeners = [];
   var _origAdd    = window.addEventListener.bind(window);
@@ -385,3 +383,4 @@ private let vibedBridgeJS = """
 
 })();
 """
+}
