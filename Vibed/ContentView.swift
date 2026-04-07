@@ -59,6 +59,26 @@ struct ContentView: View {
                 AccountView()
                     .environmentObject(store)
                     .offset(x: horizontalOffset + geo.size.width)
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 10)
+                            .onChanged { value in
+                                if gestureAxis == nil {
+                                    panBaseH = horizontalOffset
+                                }
+                                handleDrag(
+                                    CGPoint(x: value.translation.width,
+                                            y: value.translation.height),
+                                    size: geo.size
+                                )
+                            }
+                            .onEnded { value in
+                                handleDragEnd(
+                                    CGPoint(x: value.velocity.width,
+                                            y: value.velocity.height),
+                                    size: geo.size
+                                )
+                            }
+                    )
 
                 // ── Feed panel ─────────────────────────────────────────────
                 ZStack {

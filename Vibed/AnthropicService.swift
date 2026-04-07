@@ -7,13 +7,28 @@ final class AnthropicService {
     private let session = URLSession.shared
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
 
-    func generateHTML(description: String, completion: @escaping (Result<String, Error>) -> Void) {
+    func generateHTML(description: String, imageData: Data? = nil, completion: @escaping (Result<String, Error>) -> Void) {
+        let userContent: Any
+        if let imageData {
+            let base64 = imageData.base64EncodedString()
+            userContent = [
+                ["type": "image",
+                 "source": ["type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": base64] as [String: Any]] as [String: Any],
+                ["type": "text",
+                 "text": "Create a self-contained mobile HTML app that: \(description)"] as [String: Any]
+            ]
+        } else {
+            userContent = "Create a self-contained mobile HTML app that: \(description)"
+        }
+
         let requestBody: [String: Any] = [
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 4000,
             "system": "You output ONLY raw HTML. Your entire response must start with <!DOCTYPE html> and end with </html>. No explanations, no markdown, no code fences, nothing before or after the HTML.",
             "messages": [
-                ["role": "user", "content": "Create a self-contained mobile HTML app that: \(description)"]
+                ["role": "user", "content": userContent]
             ]
         ]
 
