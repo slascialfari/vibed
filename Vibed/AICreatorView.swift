@@ -1,4 +1,5 @@
 import SwiftUI
+import PhotosUI
 
 struct AICreatorView: View {
 
@@ -10,6 +11,9 @@ struct AICreatorView: View {
     @State private var currentHTML = ""
     @State private var isGenerating = false
     @State private var errorMessage: String?
+
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var selectedImage: UIImage?
 
     private var canGenerate: Bool {
         !descriptionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -117,6 +121,55 @@ struct AICreatorView: View {
                         }
                     )
             }
+
+            // ── Image reference ────────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Reference image")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+
+                HStack(spacing: 12) {
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                        Label(selectedImage == nil ? "Add Image" : "Change Image",
+                              systemImage: "photo.on.rectangle")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.08), in: Capsule())
+                            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    }
+
+                    if let selectedImage {
+                        Image(uiImage: selectedImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 52, height: 52)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .overlay(RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.white.opacity(0.2), lineWidth: 1))
+
+                        Button {
+                            self.selectedImage = nil
+                            self.selectedPhotoItem = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 20))
+                                .foregroundColor(.white.opacity(0.5))
+                        }
+                    }
+
+                    Spacer()
+                }
+            }
+            .onChange(of: selectedPhotoItem) { _, item in
+                Task {
+                    if let data = try? await item?.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data) {
+                        selectedImage = image
+                    }
+                }
+            }
         }
     }
 
@@ -203,7 +256,8 @@ struct AICreatorView: View {
         isGenerating = true
         errorMessage = nil
 
-        AnthropicService.shared.generateHTML(description: descriptionText) { result in
+        let imageData = selectedImage?.jpegData(compressionQuality: 0.8)
+        AnthropicService.shared.generateHTML(description: descriptionText, imageData: imageData) { result in
             DispatchQueue.main.async {
                 isGenerating = false
                 switch result {
@@ -222,8 +276,8 @@ struct AICreatorView: View {
         errorMessage = nil
 
         let fullDescription = descriptionText + " " + refinePrompt
-
-        AnthropicService.shared.generateHTML(description: fullDescription) { result in
+        let imageData = selectedImage?.jpegData(compressionQuality: 0.8)
+        AnthropicService.shared.generateHTML(description: fullDescription, imageData: imageData) { result in
             DispatchQueue.main.async {
                 isGenerating = false
                 switch result {
