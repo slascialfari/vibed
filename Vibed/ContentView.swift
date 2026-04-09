@@ -71,11 +71,13 @@ struct ContentView: View {
                                 }
                             }
 
-                        viewModeFooter(
-                            vibe: store.vibes[currentIndex],
-                            safeBottom: geo.safeAreaInsets.bottom
-                        )
-                        .allowsHitTesting(false)
+                        if !store.vibes.isEmpty && currentIndex < store.vibes.count {
+                            viewModeFooter(
+                                vibe: store.vibes[currentIndex],
+                                safeBottom: geo.safeAreaInsets.bottom
+                            )
+                            .allowsHitTesting(false)
+                        }
                     }
 
                     if isInteractive {

@@ -2,71 +2,65 @@
 
 import Foundation
 import Combine
+import Supabase
 
 @MainActor
 final class VibeStore: ObservableObject {
-    @Published var vibes: [Vibe]
-    
-    private var userVibes: [Vibe]
-    private let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
 
-    var createdVibes: [Vibe] {
-        userVibes
-    }
+    @Published var vibes: [Vibe] = []
+    @Published var isLoading = false
+    @Published var errorMessage: String?
 
     init() {
-        userVibes = Self.loadUserVibes(from: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!)
-        vibes = Vibe.samples + userVibes
+        Task { await fetchVibes() }
     }
 
-    func publish(_ vibe: Vibe) {
-        userVibes.append(vibe)
-        saveVibe(vibe)
-        vibes = Vibe.samples + userVibes
-    }
-    
-    func update(_ vibe: Vibe) {
-        guard let index = userVibes.firstIndex(where: { $0.id == vibe.id }) else { return }
-        userVibes[index] = vibe
-        saveVibe(vibe)
-        vibes = Vibe.samples + userVibes
-    }
+    func fetchVibes() async {
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
 
-    func delete(_ vibe: Vibe) {
-        if let index = userVibes.firstIndex(where: { $0.id == vibe.id }) {
-            userVibes.remove(at: index)
-            deleteVibeFile(vibe)
-            vibes = Vibe.samples + userVibes
-        }
-    }
-    
-    private static func loadUserVibes(from documentsURL: URL) -> [Vibe] {
-        let fileManager = FileManager.default
         do {
-            let urls = try fileManager.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil)
-            let jsonURLs = urls.filter { $0.pathExtension == "json" }
-            var vibes: [Vibe] = []
-            for url in jsonURLs {
-                if let data = try? Data(contentsOf: url),
-                   let vibe = try? JSONDecoder().decode(Vibe.self, from: data) {
-                    vibes.append(vibe)
+            struct Row: Decodable {
+                let id: UUID
+                let title: String
+                let description: String?
+                let htmlContent: String
+                let createdAt: String
+
+                enum CodingKeys: String, CodingKey {
+                    case id, title, description
+                    case htmlContent = "html_content"
+                    case createdAt   = "created_at"
                 }
             }
-            return vibes.sorted(by: { $0.createdAt < $1.createdAt })
+
+            let rows: [Row] = try await supabase
+                .from("vibes")
+                .select("id, title, description, html_content, created_at")
+                .eq("status", value: "approved")
+                .order("created_at", ascending: false)
+                .execute()
+                .value
+
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+            vibes = rows.map { row in
+                Vibe(
+                    id:          row.id,
+                    title:       row.title,
+                    description: row.description ?? "",
+                    htmlContent: row.htmlContent,
+                    createdAt:   formatter.date(from: row.createdAt) ?? Date()
+                )
+            }
         } catch {
-            return []
+            errorMessage = error.localizedDescription
+            // Fall back to built-in samples so the feed isn't empty
+            if vibes.isEmpty {
+                vibes = Vibe.samples
+            }
         }
-    }
-    
-    private func saveVibe(_ vibe: Vibe) {
-        let url = documentsURL.appendingPathComponent("\(vibe.id.uuidString).json")
-        if let data = try? JSONEncoder().encode(vibe) {
-            try? data.write(to: url)
-        }
-    }
-    
-    private func deleteVibeFile(_ vibe: Vibe) {
-        let url = documentsURL.appendingPathComponent("\(vibe.id.uuidString).json")
-        try? FileManager.default.removeItem(at: url)
     }
 }

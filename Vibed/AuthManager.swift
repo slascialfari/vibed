@@ -35,9 +35,43 @@ final class AuthManager: ObservableObject {
     // MARK: - Auth state listener
 
     private func startListening() async {
-        for await (_, session) in supabase.auth.authStateChanges {
+        for await (event, session) in supabase.auth.authStateChanges {
             self.session = session
+            if event == .signedIn, let session {
+                await upsertProfile(session: session)
+            }
         }
+    }
+
+    private func upsertProfile(session: Session) async {
+        let user = session.user
+        let username = user.userMetadata["user_name"]?.value as? String
+            ?? user.email
+            ?? user.id.uuidString
+        let avatarURL = user.userMetadata["avatar_url"]?.value as? String
+
+        struct ProfileUpsert: Encodable {
+            let id: UUID
+            let username: String
+            let githubUsername: String?
+            let avatarUrl: String?
+            enum CodingKeys: String, CodingKey {
+                case id
+                case username
+                case githubUsername = "github_username"
+                case avatarUrl      = "avatar_url"
+            }
+        }
+
+        try? await supabase
+            .from("profiles")
+            .upsert(ProfileUpsert(
+                id:             user.id,
+                username:       username,
+                githubUsername: username,
+                avatarUrl:      avatarURL
+            ))
+            .execute()
     }
 
     // MARK: - Sign in
@@ -50,6 +84,7 @@ final class AuthManager: ObservableObject {
         do {
             let url = try supabase.auth.getOAuthSignInURL(
                 provider: .github,
+                scopes: "read:user repo",
                 redirectTo: URL(string: "vibed://auth/callback")!
             )
             await UIApplication.shared.open(url)
