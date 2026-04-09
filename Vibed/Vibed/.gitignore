@@ -1,0 +1,17 @@
+# Secrets — never commit
+Secrets.plist
+**/Secrets.plist
+
+# Config contains no secrets but is gitignored to allow local-only overrides
+Config.swift
+**/Config.swift
+
+# Xcode
+xcuserdata/
+*.xccheckout
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+*.xcuserstate
+.DS_Store
