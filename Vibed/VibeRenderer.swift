@@ -10,6 +10,11 @@ import CoreHaptics
 struct VibeRenderer: UIViewRepresentable {
     let vibe: Vibe
 
+    /// When set, load content from this local file URL (multi-file repo support).
+    /// allowingReadAccessTo is set to the parent directory so relative assets resolve.
+    /// If nil, falls back to vibe.htmlContent.
+    var fileURL: URL? = nil
+
     /// true  → WKWebView receives all touches (interactive / full-screen mode)
     /// false → container blocks touches so the SwiftUI gesture layer handles them
     var isInteractive: Bool = false
@@ -62,18 +67,37 @@ struct VibeRenderer: UIViewRepresentable {
         ])
 
         context.coordinator.attach(to: wv)
-        wv.loadHTMLString(vibe.htmlContent, baseURL: nil)
+        loadContent(into: wv)
+        context.coordinator.loadedKey = loadKey
         return container
     }
 
     func updateUIView(_ container: UIView, context: Context) {
         container.isUserInteractionEnabled = isInteractive
 
-        guard context.coordinator.loadedVibeID != vibe.id else { return }
-        context.coordinator.loadedVibeID = vibe.id
+        guard context.coordinator.loadedKey != loadKey else { return }
+        context.coordinator.loadedKey = loadKey
         // Hide while loading new content; didFinish will fade back in
         context.coordinator.webView?.alpha = 0
-        context.coordinator.webView?.loadHTMLString(vibe.htmlContent, baseURL: nil)
+        if let wv = context.coordinator.webView { loadContent(into: wv) }
+    }
+
+    // MARK: - Helpers
+
+    /// A stable string key representing the currently loaded content.
+    /// Changes when vibe switches OR when fileURL is resolved.
+    private var loadKey: String {
+        "\(vibe.id)-\(fileURL?.path ?? "html")"
+    }
+
+    private func loadContent(into wv: WKWebView) {
+        if let url = fileURL {
+            // Allow read access to the full repo folder so relative assets work
+            wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        } else if let html = vibe.htmlContent {
+            wv.loadHTMLString(html, baseURL: nil)
+        }
+        // If neither is available (GitHub vibe still downloading), leave blank
     }
 
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
@@ -90,7 +114,7 @@ final class Coordinator: NSObject,
                          WKUIDelegate,
                          VibeHapticsHandler {
 
-    var loadedVibeID: UUID?
+    var loadedKey: String?
     private(set) weak var webView: WKWebView?
     private let motion = CMMotionManager()
     private let isInteractive: Bool

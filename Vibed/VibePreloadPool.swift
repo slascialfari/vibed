@@ -5,14 +5,21 @@ import Combine
 import UIKit
 import WebKit
 import CoreMotion
+import Supabase
 
 // MARK: - VibePreloadPool
 
 /// Owns a sliding window of WKWebViews centred on the current index.
 /// Always keeps current ±2 preloaded; evicts anything outside that window.
 /// One CMMotionManager broadcasts sensor data to all live webviews.
+/// For GitHub-backed vibes, downloads the repo ZIP in the background and
+/// loads via loadFileURL once extraction is complete.
 @MainActor
 final class VibePreloadPool: ObservableObject {
+
+    /// Vibe IDs that are currently being downloaded.
+    /// ContentView observes this to show a loading spinner on the current card.
+    @Published var downloadingIDs: Set<UUID> = []
 
     private struct Slot {
         let webView: WKWebView
@@ -21,14 +28,17 @@ final class VibePreloadPool: ObservableObject {
     }
 
     private var slots: [Int: Slot] = [:]
+    private var slotVibeIDs: [Int: UUID] = [:]     // for clean eviction tracking
+    private var fileURLCache: [UUID: URL] = [:]    // per-vibe cached local file URL
     private let motion = CMMotionManager()
 
     // MARK: - Public API
 
     func webView(at index: Int) -> WKWebView? { slots[index]?.webView }
 
-    /// Load real HTML for current ±2 slots so adjacent cards are already rendered
-    /// before the user swipes to them. New slots fade in after didFinish.
+    /// Load real HTML/files for current ±2 slots so adjacent cards are already
+    /// rendered before the user swipes. For GitHub-backed vibes, starts the ZIP
+    /// download in the background.
     func prime(around center: Int, vibes: [Vibe]) {
         guard !vibes.isEmpty else { return }
         let lo   = max(0, center - 2)
@@ -36,26 +46,79 @@ final class VibePreloadPool: ObservableObject {
         let keep = lo...hi
 
         for key in slots.keys where !keep.contains(key) { evict(key) }
-        for i in keep where slots[i] == nil { loadHTML(i, vibe: vibes[i]) }
+        for i in keep where slots[i] == nil { loadSlot(i, vibe: vibes[i]) }
 
         ensureMotion()
     }
 
-    /// Called when navigating away from a slot. Silently reloads the HTML
+    /// Called when navigating away from a slot. Silently reloads the content
     /// off-screen so the vibe is fresh and ready for the next visit.
     func resetSlot(index: Int, vibe: Vibe) {
         guard let wv = slots[index]?.webView else { return }
         wv.alpha = 0
-        wv.loadHTMLString(vibe.htmlContent, baseURL: nil)
+        loadContent(into: wv, vibe: vibe)
     }
 
-    // MARK: - Private
+    // MARK: - Private: slot lifecycle
 
-    private func loadHTML(_ index: Int, vibe: Vibe) {
+    private func loadSlot(_ index: Int, vibe: Vibe) {
         let slot = makeSlot()
         slots[index] = slot
-        slot.webView.loadHTMLString(vibe.htmlContent, baseURL: nil)
+        slotVibeIDs[index] = vibe.id
+
+        if let cachedURL = fileURLCache[vibe.id] {
+            // Already have a local URL (from a previous download this session)
+            slot.webView.loadFileURL(cachedURL,
+                                     allowingReadAccessTo: cachedURL.deletingLastPathComponent())
+        } else if let repoName = vibe.githubRepoName {
+            // GitHub-backed vibe: download in background
+            startDownload(for: vibe, repoName: repoName, into: slot, at: index)
+        } else if let html = vibe.htmlContent {
+            slot.webView.loadHTMLString(html, baseURL: nil)
+        }
     }
+
+    private func startDownload(for vibe: Vibe, repoName: String, into slot: Slot, at index: Int) {
+        downloadingIDs.insert(vibe.id)
+
+        Task {
+            let parts = repoName.split(separator: "/")
+            guard parts.count == 2 else {
+                downloadingIDs.remove(vibe.id)
+                return
+            }
+            let owner = String(parts[0])
+            let repo  = String(parts[1])
+            let token = (try? await supabase.auth.session)?.providerToken
+
+            do {
+                let url = try await GitHubRepoService.shared.fetchRepoContents(
+                    owner: owner, repo: repo, token: token
+                )
+                // Back on MainActor (Task inherits @MainActor from VibePreloadPool)
+                fileURLCache[vibe.id] = url
+                downloadingIDs.remove(vibe.id)
+
+                // Only load into the webView if this slot is still live for this vibe
+                if let currentSlot = slots[index], currentSlot.webView === slot.webView {
+                    slot.webView.loadFileURL(url,
+                                             allowingReadAccessTo: url.deletingLastPathComponent())
+                }
+            } catch {
+                downloadingIDs.remove(vibe.id)
+            }
+        }
+    }
+
+    private func loadContent(into wv: WKWebView, vibe: Vibe) {
+        if let url = fileURLCache[vibe.id] {
+            wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        } else if let html = vibe.htmlContent {
+            wv.loadHTMLString(html, baseURL: nil)
+        }
+    }
+
+    // MARK: - Private: slot creation
 
     private func makeSlot() -> Slot {
         let msg = SlotMsg()
@@ -95,6 +158,10 @@ final class VibePreloadPool: ObservableObject {
     }
 
     private func evict(_ index: Int) {
+        // Clean up downloading state so the spinner doesn't stick
+        if let vibeID = slotVibeIDs.removeValue(forKey: index) {
+            downloadingIDs.remove(vibeID)
+        }
         guard let slot = slots.removeValue(forKey: index) else { return }
         slot.webView.stopLoading()
         slot.webView.navigationDelegate = nil
@@ -102,6 +169,8 @@ final class VibePreloadPool: ObservableObject {
         slot.webView.configuration.userContentController
             .removeScriptMessageHandler(forName: "haptics")
     }
+
+    // MARK: - Motion
 
     private func ensureMotion() {
         guard !motion.isDeviceMotionActive, motion.isDeviceMotionAvailable else { return }
@@ -151,6 +220,7 @@ private final class SlotNav: NSObject, WKNavigationDelegate, WKUIDelegate {
                  decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         let scheme = action.request.url?.scheme?.lowercased()
+        // Allow file:// for local repo assets; block http/https external navigation
         decisionHandler(scheme == "http" || scheme == "https" ? .cancel : .allow)
     }
 
@@ -220,7 +290,6 @@ struct VibeCardView: UIViewRepresentable {
         let current = container.subviews.first as? WKWebView
         guard current !== webView else { return }
         if let old = current {
-            // Deactivate constraints before removing to avoid unsatisfiable warnings
             NSLayoutConstraint.deactivate(old.constraints)
             old.removeFromSuperview()
         }
@@ -228,9 +297,6 @@ struct VibeCardView: UIViewRepresentable {
     }
 
     private func attach(_ wv: WKWebView, to container: UIView) {
-        // addSubview auto-removes from any previous superview.
-        // Use constraints so the WKWebView fills the container regardless of
-        // when makeUIView is called (container.bounds may be .zero at that point).
         wv.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(wv)
         NSLayoutConstraint.activate([
@@ -239,8 +305,6 @@ struct VibeCardView: UIViewRepresentable {
             wv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
-        // Fire a JS resize event so content that read window.innerWidth at load
-        // time can re-layout to the real container size.
         wv.evaluateJavaScript("window.dispatchEvent(new Event('resize'));",
                               completionHandler: nil)
     }

@@ -78,6 +78,21 @@ struct ContentView: View {
                             )
                             .allowsHitTesting(false)
                         }
+
+                        // Spinner while the current vibe's ZIP is downloading
+                        let currentVibeID = store.vibes.indices.contains(currentIndex)
+                            ? store.vibes[currentIndex].id : nil
+                        if let id = currentVibeID, pool.downloadingIDs.contains(id) {
+                            ZStack {
+                                Color.black.opacity(0.6)
+                                ProgressView()
+                                    .tint(.white)
+                                    .scaleEffect(1.4)
+                            }
+                            .ignoresSafeArea()
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                        }
                     }
 
                     if isInteractive {
@@ -122,6 +137,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.2), value: isInteractive)
+        .animation(.easeInOut(duration: 0.2), value: pool.downloadingIDs.isEmpty)
     }
 
     // MARK: - Carousel

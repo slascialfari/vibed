@@ -4,6 +4,11 @@ import SwiftUI
 
 struct PreviewView: View {
     let vibe: Vibe
+
+    /// Local file URL for multi-file GitHub repo vibes.
+    /// When set, VibeRenderer loads from disk instead of vibe.htmlContent.
+    var fileURL: URL? = nil
+
     var onBack: () -> Void
     var onPublish: () -> Void
 
@@ -11,7 +16,7 @@ struct PreviewView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            VibeRenderer(vibe: vibe, isInteractive: true)
+            VibeRenderer(vibe: vibe, fileURL: fileURL, isInteractive: true)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
@@ -33,7 +38,7 @@ struct PreviewView: View {
 
                 // Publish button — bottom center
                 Button(action: onPublish) {
-                    Text("Publish")
+                    Text("Submit for Approval")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(.black)
                         .padding(.horizontal, 48)

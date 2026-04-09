@@ -19,32 +19,12 @@ let availableBranches: [Branch] = [
     Branch(id: "experiments", name: "Experiments", icon: "flask"),
 ]
 
-// MARK: - GitHubRepo
-
-struct GitHubRepo: Identifiable, Decodable {
-    let id: Int
-    let name: String
-    let fullName: String
-    let description: String?
-    let htmlUrl: String
-    let owner: Owner
-
-    struct Owner: Decodable {
-        let login: String
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case id, name, description, owner
-        case fullName = "full_name"
-        case htmlUrl  = "html_url"
-    }
-}
-
 // MARK: - VibeSubmission (Supabase insert payload)
+// html_content is intentionally omitted — GitHub-backed vibes store the repo
+// reference instead. The column accepts NULL for repo-backed entries.
 
 private struct VibeSubmission: Encodable {
     let title: String
-    let htmlContent: String
     let githubRepoUrl: String
     let githubRepoName: String
     let category: String
@@ -53,7 +33,6 @@ private struct VibeSubmission: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case title
-        case htmlContent    = "html_content"
         case githubRepoUrl  = "github_repo_url"
         case githubRepoName = "github_repo_name"
         case category
@@ -72,7 +51,7 @@ struct AccountView: View {
     // Form state
     @State private var vibeTitle       = ""
     @State private var selectedBranch: Branch?
-    @State private var previewVibe: Vibe?
+    @State private var showPreview     = false
     @State private var showSubmitted   = false
 
     // Repo picker state
@@ -81,10 +60,10 @@ struct AccountView: View {
     @State private var repoError: String?
     @State private var selectedRepo: GitHubRepo?
 
-    // HTML fetch state
-    @State private var fetchedHTML: String?
-    @State private var isFetchingHTML = false
-    @State private var htmlError: String?
+    // Repo download state (replaces single html fetch)
+    @State private var fetchedFileURL: URL?
+    @State private var isFetchingRepo  = false
+    @State private var repoFetchError: String?
 
     // Submit state
     @State private var isSubmitting  = false
@@ -95,8 +74,17 @@ struct AccountView: View {
         return t.isEmpty ? (selectedRepo?.name ?? "Untitled") : t
     }
 
-    private var canPreview: Bool { fetchedHTML != nil }
-    private var canSubmit: Bool  { fetchedHTML != nil && selectedBranch != nil && !isSubmitting }
+    private var canPreview: Bool { fetchedFileURL != nil }
+    private var canSubmit: Bool  { fetchedFileURL != nil && selectedBranch != nil && !isSubmitting }
+
+    // The Vibe passed to PreviewView (no htmlContent; VibeRenderer uses fileURL)
+    private var previewVibe: Vibe {
+        Vibe(
+            title: resolvedTitle,
+            description: "",
+            githubRepoName: selectedRepo?.fullName
+        )
+    }
 
     var body: some View {
         ZStack {
@@ -108,17 +96,21 @@ struct AccountView: View {
                 signInView
             }
 
-            if let vibe = previewVibe {
+            if showPreview, let url = fetchedFileURL {
                 PreviewView(
-                    vibe: vibe,
-                    onBack: { previewVibe = nil },
-                    onPublish: { previewVibe = nil }
+                    vibe: previewVibe,
+                    fileURL: url,
+                    onBack: { showPreview = false },
+                    onPublish: {
+                        showPreview = false
+                        Task { await submitVibe() }
+                    }
                 )
                 .ignoresSafeArea()
                 .transition(.opacity)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: previewVibe != nil)
+        .animation(.easeInOut(duration: 0.2), value: showPreview)
         .animation(.easeInOut(duration: 0.2), value: auth.isLoggedIn)
     }
 
@@ -294,24 +286,24 @@ struct AccountView: View {
                             }
                         }
 
-                        // HTML fetch status
-                        if isFetchingHTML {
+                        // Download status
+                        if isFetchingRepo {
                             HStack(spacing: 8) {
                                 ProgressView().tint(.white)
-                                Text("Fetching index.html…")
+                                Text("Downloading repo…")
                                     .font(.system(size: 12))
                                     .foregroundStyle(.white.opacity(0.5))
                             }
-                        } else if let err = htmlError {
+                        } else if let err = repoFetchError {
                             Text(err)
                                 .font(.system(size: 12))
                                 .foregroundStyle(.orange.opacity(0.8))
-                        } else if fetchedHTML != nil, let repo = selectedRepo {
+                        } else if fetchedFileURL != nil, let repo = selectedRepo {
                             HStack(spacing: 6) {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(.green)
                                     .font(.system(size: 13))
-                                Text("index.html loaded from \(repo.name)")
+                                Text("Ready to preview: \(repo.name)")
                                     .font(.system(size: 12))
                                     .foregroundStyle(.white.opacity(0.6))
                             }
@@ -338,11 +330,7 @@ struct AccountView: View {
                     // Actions
                     HStack(spacing: 10) {
                         Button {
-                            if let html = fetchedHTML {
-                                previewVibe = Vibe(title: resolvedTitle,
-                                                  description: "",
-                                                  htmlContent: html)
-                            }
+                            showPreview = true
                         } label: {
                             Text("Preview")
                                 .font(.system(size: 14, weight: .semibold))
@@ -416,10 +404,10 @@ struct AccountView: View {
     private func repoRow(_ repo: GitHubRepo) -> some View {
         let isSelected = selectedRepo?.id == repo.id
         return Button {
-            selectedRepo = repo
-            fetchedHTML  = nil
-            htmlError    = nil
-            Task { await fetchIndexHTML(for: repo) }
+            selectedRepo   = repo
+            fetchedFileURL = nil
+            repoFetchError = nil
+            Task { await downloadRepo(repo) }
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -503,55 +491,36 @@ struct AccountView: View {
                 repoError = "GitHub token unavailable — please reconnect."
                 return
             }
-
-            var request = URLRequest(url: URL(string: "https://api.github.com/user/repos?sort=updated&per_page=50")!)
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-
-            let (data, _) = try await URLSession.shared.data(for: request)
-            repos = try JSONDecoder().decode([GitHubRepo].self, from: data)
+            repos = try await GitHubRepoService.shared.listRepos(token: token)
         } catch {
             repoError = error.localizedDescription
         }
     }
 
-    // MARK: - Fetch index.html
+    // MARK: - Download repo as ZIP
 
-    private func fetchIndexHTML(for repo: GitHubRepo) async {
-        isFetchingHTML = true
-        htmlError      = nil
-        defer { isFetchingHTML = false }
+    private func downloadRepo(_ repo: GitHubRepo) async {
+        isFetchingRepo = true
+        repoFetchError = nil
+        defer { isFetchingRepo = false }
 
-        let owner = repo.owner.login
-        let name  = repo.name
-
-        // Try main branch first, fall back to master
-        let urls = [
-            "https://raw.githubusercontent.com/\(owner)/\(name)/main/index.html",
-            "https://raw.githubusercontent.com/\(owner)/\(name)/master/index.html",
-        ]
-
-        for urlString in urls {
-            guard let url = URL(string: urlString) else { continue }
-            do {
-                let (data, response) = try await URLSession.shared.data(from: url)
-                if let http = response as? HTTPURLResponse, http.statusCode == 200,
-                   let html = String(data: data, encoding: .utf8) {
-                    fetchedHTML = html
-                    return
-                }
-            } catch {
-                continue
-            }
+        do {
+            let token = (try? await supabase.auth.session)?.providerToken
+            let url = try await GitHubRepoService.shared.fetchRepoContents(
+                owner: repo.owner.login,
+                repo: repo.name,
+                token: token
+            )
+            fetchedFileURL = url
+        } catch {
+            repoFetchError = error.localizedDescription
         }
-
-        htmlError = "No index.html found in \(repo.name) (tried main and master branches)"
     }
 
     // MARK: - Submit to Supabase
 
     private func submitVibe() async {
-        guard let html = fetchedHTML,
+        guard fetchedFileURL != nil,
               let repo = selectedRepo,
               let branch = selectedBranch else { return }
 
@@ -564,13 +533,12 @@ struct AccountView: View {
             let creatorId = session.user.id
 
             let payload = VibeSubmission(
-                title:           resolvedTitle,
-                htmlContent:     html,
-                githubRepoUrl:   repo.htmlUrl,
-                githubRepoName:  repo.fullName,
-                category:        branch.id,
-                status:          "pending",
-                creatorId:       creatorId
+                title:          resolvedTitle,
+                githubRepoUrl:  repo.htmlUrl,
+                githubRepoName: repo.fullName,
+                category:       branch.id,
+                status:         "pending",
+                creatorId:      creatorId
             )
 
             try await supabase
@@ -582,9 +550,9 @@ struct AccountView: View {
                 showSubmitted  = true
                 vibeTitle      = ""
                 selectedRepo   = nil
-                fetchedHTML    = nil
+                fetchedFileURL = nil
                 selectedBranch = nil
-                previewVibe    = nil
+                showPreview    = false
             }
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(6))

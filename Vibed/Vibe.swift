@@ -6,20 +6,23 @@ struct Vibe: Identifiable, Codable, Equatable {
     let id: UUID
     let title: String
     let description: String
-    let htmlContent: String
+    let htmlContent: String?      // nil for GitHub-backed vibes
+    let githubRepoName: String?   // "owner/repo", present for GitHub-backed vibes
     let createdAt: Date
 
     init(
         id: UUID = UUID(),
         title: String,
         description: String,
-        htmlContent: String,
+        htmlContent: String? = nil,
+        githubRepoName: String? = nil,
         createdAt: Date = Date()
     ) {
         self.id = id
         self.title = title
         self.description = description
         self.htmlContent = htmlContent
+        self.githubRepoName = githubRepoName
         self.createdAt = createdAt
     }
 }
@@ -44,6 +47,7 @@ extension Vibe {
         description: "Slide to dodge, tap to blast asteroids",
         htmlContent: shooterGameHTML
     )
+
 }
 
 // MARK: - HTML Content
