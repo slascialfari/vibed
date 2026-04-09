@@ -74,7 +74,10 @@ final class VibePreloadPool: ObservableObject {
 
         // Use the screen bounds so HTML/JS reads the correct viewport size
         // (window.innerWidth, canvas size, etc.) while the WKWebView is off-screen.
-        let wv = WKWebView(frame: UIScreen.main.bounds, configuration: config)
+        let screenBounds = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.screen.bounds ?? CGRect(x: 0, y: 0, width: 393, height: 852)
+        let wv = WKWebView(frame: screenBounds, configuration: config)
         wv.scrollView.isScrollEnabled = false
         wv.scrollView.bounces = false
         wv.scrollView.showsVerticalScrollIndicator = false
