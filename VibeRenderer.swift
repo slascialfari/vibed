@@ -14,7 +14,7 @@ struct VibeRenderer: UIViewRepresentable {
     /// false → container blocks touches so the SwiftUI gesture layer handles them
     var isInteractive: Bool = false
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(isInteractive: isInteractive) }
 
     func makeUIView(context: Context) -> UIView {
         let config = WKWebViewConfiguration()
@@ -50,6 +50,8 @@ struct VibeRenderer: UIViewRepresentable {
         let container = UIView()
         container.backgroundColor = .black
         container.isUserInteractionEnabled = isInteractive
+        // Start invisible; fade in after didFinish fires
+        wv.alpha = 0
         container.addSubview(wv)
         wv.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -60,6 +62,7 @@ struct VibeRenderer: UIViewRepresentable {
         ])
 
         context.coordinator.attach(to: wv)
+        wv.loadHTMLString(vibe.htmlContent, baseURL: nil)
         return container
     }
 
@@ -68,6 +71,8 @@ struct VibeRenderer: UIViewRepresentable {
 
         guard context.coordinator.loadedVibeID != vibe.id else { return }
         context.coordinator.loadedVibeID = vibe.id
+        // Hide while loading new content; didFinish will fade back in
+        context.coordinator.webView?.alpha = 0
         context.coordinator.webView?.loadHTMLString(vibe.htmlContent, baseURL: nil)
     }
 
@@ -88,6 +93,11 @@ final class Coordinator: NSObject,
     var loadedVibeID: UUID?
     private(set) weak var webView: WKWebView?
     private let motion = CMMotionManager()
+    private let isInteractive: Bool
+
+    init(isInteractive: Bool) {
+        self.isInteractive = isInteractive
+    }
 
     func attach(to wv: WKWebView) {
         webView = wv
@@ -189,6 +199,12 @@ final class Coordinator: NSObject,
     }
 
     // MARK: WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        UIView.animate(withDuration: 0.15) {
+            webView.alpha = 1
+        }
+    }
 
     func webView(
         _ webView: WKWebView,

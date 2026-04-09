@@ -7,17 +7,21 @@ import SwiftUI
 struct ContentView: View {
 
     @StateObject private var store = VibeStore()
+    @StateObject private var pool  = VibePreloadPool()
 
     // ── Feed state ─────────────────────────────────────────────────────────────
     @State private var currentIndex  = 0
-    @State private var isInteractive = false   // double-tap → full-screen mode
+    @State private var isInteractive = false
 
-    // ── Vertical browsing ──────────────────────────────────────────────────────
-    @State private var dragY: CGFloat = 0
-    @State private var isBrowsing    = false
+    // ── Carousel drag ──────────────────────────────────────────────────────────
+    // dragY offsets ALL cards simultaneously — no webview swapping needed.
+    // When navigate fires: currentIndex += 1, dragY = 0 are set atomically.
+    // Because card position = (i - currentIndex)*height + dragY, both values
+    // cancel out and visible cards don't jump.
+    @State private var dragY:     CGFloat = 0
+    @State private var isBrowsing         = false
 
     // ── Horizontal nav (feed ↔ account) ───────────────────────────────────────
-    // 0 = feed visible   -width = account visible
     @State private var horizontalOffset: CGFloat = 0
 
     // ── Gesture axis lock ──────────────────────────────────────────────────────
@@ -34,33 +38,31 @@ struct ContentView: View {
                 AccountView()
                     .environmentObject(store)
                     .offset(x: horizontalOffset + geo.size.width)
-                    // Swipe right to close account
                     .gesture(
                         DragGesture(minimumDistance: 20)
                             .onChanged { v in
-                                let dx = v.translation.width
-                                if dx > 0 {
-                                    horizontalOffset = max(-geo.size.width, min(0, -geo.size.width + dx))
+                                if v.translation.width > 0 {
+                                    horizontalOffset = max(-geo.size.width,
+                                                          min(0, -geo.size.width + v.translation.width))
                                 }
                             }
                             .onEnded { v in
-                                let threshold = geo.size.width * 0.3
-                                let fast = v.velocity.width > 500
+                                let close = v.translation.width > geo.size.width * 0.3
+                                           || v.velocity.width > 500
                                 withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
-                                    horizontalOffset = (v.translation.width > threshold || fast) ? 0 : -geo.size.width
+                                    horizontalOffset = close ? 0 : -geo.size.width
                                 }
                             }
                     )
 
                 // ── Feed panel ─────────────────────────────────────────────────
                 ZStack {
-                    vibeStack(size: geo.size)
+                    carousel(size: geo.size)
 
                     if !isInteractive {
-                        // Transparent layer that owns gestures in view mode
                         Color.clear
                             .contentShape(Rectangle())
-                            .gesture(browseAndAccountGesture(geo: geo))
+                            .gesture(feedGesture(geo: geo))
                             .onTapGesture(count: 2) {
                                 withAnimation(.easeInOut(duration: 0.22)) {
                                     isInteractive = true
@@ -74,7 +76,6 @@ struct ContentView: View {
                         .allowsHitTesting(false)
                     }
 
-                    // Back button — bottom-left, white 60% opacity
                     if isInteractive {
                         VStack {
                             Spacer()
@@ -101,38 +102,49 @@ struct ContentView: View {
                 .offset(x: horizontalOffset)
             }
             .clipped()
+            .onAppear {
+                pool.prime(around: currentIndex, vibes: store.vibes)
+            }
+            .onChange(of: currentIndex) { oldIndex, newIndex in
+                // Reload old slot off-screen so it restarts fresh on next visit
+                if oldIndex < store.vibes.count {
+                    pool.resetSlot(index: oldIndex, vibe: store.vibes[oldIndex])
+                }
+                pool.prime(around: newIndex, vibes: store.vibes)
+            }
+            .onChange(of: store.vibes.count) { _, _ in
+                pool.prime(around: currentIndex, vibes: store.vibes)
+            }
         }
         .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.2), value: isInteractive)
     }
 
-    // MARK: - Vibe stack
+    // MARK: - Carousel
 
+    // All cards are positioned by formula: y = (i - currentIndex) * height + dragY
+    // This means every card moves together. Changing currentIndex+dragY atomically
+    // produces zero visual discontinuity — no webview needs to change containers.
     @ViewBuilder
-    private func vibeStack(size: CGSize) -> some View {
-        // Previous
-        if currentIndex > 0 {
-            VibeRenderer(vibe: store.vibes[currentIndex - 1], isInteractive: false)
-                .ignoresSafeArea()
-                .offset(y: -size.height + dragY)
-        }
+    private func carousel(size: CGSize) -> some View {
+        if !store.vibes.isEmpty {
+            let lo = max(0, currentIndex - 2)
+            let hi = min(store.vibes.count - 1, currentIndex + 2)
 
-        // Current
-        VibeRenderer(vibe: store.vibes[currentIndex], isInteractive: isInteractive)
-            .ignoresSafeArea()
-            .offset(y: dragY)
-
-        // Next
-        if currentIndex < store.vibes.count - 1 {
-            VibeRenderer(vibe: store.vibes[currentIndex + 1], isInteractive: false)
+            ForEach(lo...hi, id: \.self) { i in
+                VibeCardView(
+                    webView: pool.webView(at: i),
+                    isInteractive: isInteractive && i == currentIndex
+                )
                 .ignoresSafeArea()
-                .offset(y: size.height + dragY)
+                .offset(y: CGFloat(i - currentIndex) * size.height + dragY)
+            }
         }
     }
 
     // MARK: - Gestures
 
-    private func browseAndAccountGesture(geo: GeometryProxy) -> some Gesture {
+    private func feedGesture(geo: GeometryProxy) -> some Gesture {
         DragGesture(minimumDistance: 15)
             .onChanged { v in
                 if lockedAxis == nil {
@@ -141,13 +153,10 @@ struct ContentView: View {
                     guard ax > 15 || ay > 15 else { return }
                     lockedAxis = ax > ay * 1.4 ? .horizontal : .vertical
                 }
-
                 switch lockedAxis {
                 case .horizontal:
-                    // Only left swipe opens account
-                    let dx = v.translation.width
-                    if dx < 0 {
-                        horizontalOffset = max(-geo.size.width, dx)
+                    if v.translation.width < 0 {
+                        horizontalOffset = max(-geo.size.width, v.translation.width)
                     }
                 case .vertical:
                     handleVerticalDrag(dy: v.translation.height, height: geo.size.height)
@@ -158,12 +167,9 @@ struct ContentView: View {
             .onEnded { v in
                 defer { lockedAxis = nil }
                 switch lockedAxis {
-                case .horizontal:
-                    commitHorizontal(velocity: v.velocity.width, width: geo.size.width)
-                case .vertical:
-                    commitVertical(velocity: v.velocity.height, height: geo.size.height)
-                case nil:
-                    snapBackVertical()
+                case .horizontal: commitHorizontal(velocity: v.velocity.width, width: geo.size.width)
+                case .vertical:   commitVertical(velocity: v.velocity.height, height: geo.size.height)
+                case nil:         snapBack()
                 }
             }
     }
@@ -171,8 +177,7 @@ struct ContentView: View {
     // MARK: Horizontal
 
     private func commitHorizontal(velocity: CGFloat, width: CGFloat) {
-        let moved = abs(horizontalOffset)
-        let open  = moved > width * 0.3 || velocity < -500
+        let open = abs(horizontalOffset) > width * 0.3 || velocity < -500
         withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
             horizontalOffset = open ? -width : 0
         }
@@ -182,9 +187,11 @@ struct ContentView: View {
 
     private func handleVerticalDrag(dy: CGFloat, height: CGFloat) {
         guard !isBrowsing else { return }
-        if dy < 0, currentIndex < store.vibes.count - 1 {
+        let canGoNext = currentIndex < store.vibes.count - 1
+        let canGoPrev = currentIndex > 0
+        if dy < 0 && canGoNext {
             dragY = dy
-        } else if dy > 0, currentIndex > 0 {
+        } else if dy > 0 && canGoPrev {
             dragY = dy
         } else {
             dragY = dy / 3.5   // rubber-band at edges
@@ -197,28 +204,30 @@ struct ContentView: View {
         let flick = abs(velocity) > 600
 
         if dragY < 0, (past || flick), currentIndex < store.vibes.count - 1 {
-            navigateTo(currentIndex + 1, direction: -height)
+            navigate(to: currentIndex + 1, endY: -height)
         } else if dragY > 0, (past || flick), currentIndex > 0 {
-            navigateTo(currentIndex - 1, direction: height)
+            navigate(to: currentIndex - 1, endY: height)
         } else {
-            snapBackVertical()
+            snapBack()
         }
     }
 
-    private func navigateTo(_ newIndex: Int, direction endY: CGFloat) {
+    private func navigate(to newIndex: Int, endY: CGFloat) {
         isBrowsing = true
         withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
             dragY = endY
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(420))
+            // Atomic: card positions don't change because
+            // (i - newIndex)*height + 0  ==  (i - oldIndex)*height + endY  for i == newIndex
             currentIndex = newIndex
             dragY        = 0
             isBrowsing   = false
         }
     }
 
-    private func snapBackVertical() {
+    private func snapBack() {
         withAnimation(.interpolatingSpring(stiffness: 300, damping: 30)) {
             dragY = 0
         }
@@ -230,7 +239,6 @@ struct ContentView: View {
     private func viewModeFooter(vibe: Vibe, safeBottom: CGFloat) -> some View {
         VStack(spacing: 0) {
             Spacer()
-
             ZStack(alignment: .bottom) {
                 LinearGradient(
                     colors: [.clear, .black.opacity(0.72)],
@@ -249,17 +257,13 @@ struct ContentView: View {
                         Text("Vibed")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(.white.opacity(0.55))
-
                         Text("  ·  ")
                             .foregroundStyle(.white.opacity(0.3))
                             .font(.system(size: 12))
-
                         Text(vibe.createdAt, style: .relative)
                             .font(.system(size: 12))
                             .foregroundStyle(.white.opacity(0.45))
-
                         Spacer()
-
                         HStack(spacing: 5) {
                             Image(systemName: "hand.tap")
                                 .font(.system(size: 11, weight: .medium))
