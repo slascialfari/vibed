@@ -8,6 +8,7 @@ struct ContentView: View {
 
     @StateObject private var store = VibeStore()
     @StateObject private var pool  = VibePreloadPool()
+    @EnvironmentObject private var auth: AuthManager
 
     // ── Feed state ─────────────────────────────────────────────────────────────
     @State private var currentIndex  = 0
@@ -37,6 +38,7 @@ struct ContentView: View {
                 // ── Account panel ──────────────────────────────────────────────
                 AccountView()
                     .environmentObject(store)
+                    .environmentObject(auth)
                     .offset(x: horizontalOffset + geo.size.width)
                     .gesture(
                         DragGesture(minimumDistance: 20)
@@ -69,11 +71,13 @@ struct ContentView: View {
                                 }
                             }
 
-                        viewModeFooter(
-                            vibe: store.vibes[currentIndex],
-                            safeBottom: geo.safeAreaInsets.bottom
-                        )
-                        .allowsHitTesting(false)
+                        if !store.vibes.isEmpty && currentIndex < store.vibes.count {
+                            viewModeFooter(
+                                vibe: store.vibes[currentIndex],
+                                safeBottom: geo.safeAreaInsets.bottom
+                            )
+                            .allowsHitTesting(false)
+                        }
                     }
 
                     if isInteractive {

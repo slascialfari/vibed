@@ -75,9 +75,7 @@ struct EditorView: View {
                     .disabled(codeIsEmpty)
 
                     Button {
-                        store.publish(Vibe(title: resolvedTitle,
-                                          description: "",
-                                          htmlContent: code))
+                        // submission handled via AccountView repo picker
                     } label: {
                         Text("Publish")
                             .font(.system(size: 15, weight: .semibold))
@@ -101,7 +99,6 @@ struct EditorView: View {
                         previewVibe = nil
                     },
                     onPublish: {
-                        store.publish(vibe)
                         previewVibe = nil
                     }
                 )
