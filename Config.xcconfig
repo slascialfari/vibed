@@ -1,0 +1,9 @@
+// Config.xcconfig — NOT committed (see .gitignore)
+// Copy this file locally and fill in real values.
+
+SUPABASE_URL = https://uwmmrjgmzqlsrmywffsr.supabase.co
+SUPABASE_ANON_KEY = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV3bW1yamdtenFsc3JteXdmZnNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU2NzIwNzUsImV4cCI6MjA5MTI0ODA3NX0.yl1JKwlbAalyHGel3xCHP4vAcuT2HvUoB2UbbsRm8p0
+
+// Inject into the generated Info.plist so SupabaseClient can read them at runtime
+INFOPLIST_KEY_SUPABASE_URL = $(SUPABASE_URL)
+INFOPLIST_KEY_SUPABASE_ANON_KEY = $(SUPABASE_ANON_KEY)
