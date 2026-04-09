@@ -11,7 +11,7 @@ struct PreviewView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            VibeRenderer(vibe: vibe, enableNavigationGesture: false)
+            VibeRenderer(vibe: vibe, isInteractive: true)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {

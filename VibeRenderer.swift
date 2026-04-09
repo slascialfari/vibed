@@ -10,16 +10,9 @@ import CoreHaptics
 struct VibeRenderer: UIViewRepresentable {
     let vibe: Vibe
 
-    /// When false, no two-finger navigation gesture is added and multi-touch
-    /// is not blocked in JS — so the Vibe itself owns all touch input.
-    var enableNavigationGesture: Bool = true
-
-    /// Called once when a two-finger drag begins.
-    var onDragBegan: () -> Void = { }
-    /// Called continuously during a two-finger drag with the cumulative X/Y translation.
-    var onDragChanged: (CGPoint) -> Void = { _ in }
-    /// Called when a two-finger drag ends, with the X/Y velocity.
-    var onDragEnded: (CGPoint) -> Void = { _ in }
+    /// true  → WKWebView receives all touches (interactive / full-screen mode)
+    /// false → container blocks touches so the SwiftUI gesture layer handles them
+    var isInteractive: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -34,7 +27,7 @@ struct VibeRenderer: UIViewRepresentable {
 
         // ── JS bridge ────────────────────────────────────────────────────────
         config.userContentController.addUserScript(
-            WKUserScript(source: makeBridgeJS(blockMultiTouch: enableNavigationGesture),
+            WKUserScript(source: bridgeJS,
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true)
         )
@@ -53,9 +46,10 @@ struct VibeRenderer: UIViewRepresentable {
         wv.backgroundColor = .black
         wv.scrollView.backgroundColor = .black
 
-        // ── Container: parent of WKWebView ───────────────────────────────────
+        // ── Container ────────────────────────────────────────────────────────
         let container = UIView()
         container.backgroundColor = .black
+        container.isUserInteractionEnabled = isInteractive
         container.addSubview(wv)
         wv.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -65,30 +59,12 @@ struct VibeRenderer: UIViewRepresentable {
             wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
 
-        // ── Two-finger navigation gesture on the CONTAINER ───────────────────
-        if enableNavigationGesture {
-            let pan = UIPanGestureRecognizer(
-                target: context.coordinator,
-                action: #selector(Coordinator.handlePan(_:))
-            )
-            pan.minimumNumberOfTouches = 2
-            pan.maximumNumberOfTouches = 2
-            pan.cancelsTouchesInView = true
-            pan.delegate = context.coordinator
-            container.addGestureRecognizer(pan)
-        }
-
-        context.coordinator.onDragBegan   = onDragBegan
-        context.coordinator.onDragChanged = onDragChanged
-        context.coordinator.onDragEnded   = onDragEnded
         context.coordinator.attach(to: wv)
         return container
     }
 
     func updateUIView(_ container: UIView, context: Context) {
-        context.coordinator.onDragBegan   = onDragBegan
-        context.coordinator.onDragChanged = onDragChanged
-        context.coordinator.onDragEnded   = onDragEnded
+        container.isUserInteractionEnabled = isInteractive
 
         guard context.coordinator.loadedVibeID != vibe.id else { return }
         context.coordinator.loadedVibeID = vibe.id
@@ -107,51 +83,16 @@ struct VibeRenderer: UIViewRepresentable {
 final class Coordinator: NSObject,
                          WKNavigationDelegate,
                          WKUIDelegate,
-                         VibeHapticsHandler,
-                         UIGestureRecognizerDelegate {
+                         VibeHapticsHandler {
 
     var loadedVibeID: UUID?
     private(set) weak var webView: WKWebView?
-
-    var onDragBegan:   () -> Void        = { }
-    var onDragChanged: (CGPoint) -> Void = { _ in }
-    var onDragEnded:   (CGPoint) -> Void = { _ in }
-
     private let motion = CMMotionManager()
 
     func attach(to wv: WKWebView) {
         webView = wv
         startMotion()
     }
-
-    // MARK: Two-finger pan
-
-    @objc func handlePan(_ recognizer: UIPanGestureRecognizer) {
-        switch recognizer.state {
-        case .began:
-            onDragBegan()
-            let t = recognizer.translation(in: recognizer.view)
-            onDragChanged(CGPoint(x: t.x, y: t.y))
-        case .changed:
-            let t = recognizer.translation(in: recognizer.view)
-            onDragChanged(CGPoint(x: t.x, y: t.y))
-        case .ended, .cancelled, .failed:
-            let v = recognizer.velocity(in: recognizer.view)
-            onDragEnded(CGPoint(x: v.x, y: v.y))
-        default:
-            break
-        }
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
-    ) -> Bool { true }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRequireFailureOf other: UIGestureRecognizer
-    ) -> Bool { false }
 
     // MARK: Motion bridge
 
@@ -260,7 +201,6 @@ final class Coordinator: NSObject,
 
     // MARK: WKUIDelegate — camera & microphone
 
-    @available(iOS 15.0, *)
     func webView(
         _ webView: WKWebView,
         requestMediaCapturePermissionFor origin: WKSecurityOrigin,
@@ -295,24 +235,11 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 
 // MARK: - JS Bridge
 
-private func makeBridgeJS(blockMultiTouch: Bool) -> String {
-    let blockSection = blockMultiTouch ? """
-
-  // ── Two-finger touch block ─────────────────────────────────────────────────
-  // Feed navigation owns all two-finger gestures. Block them in the capture
-  // phase before any Vibe script sees them.
-  var _blockMulti = function (e) {
-    if (e.touches.length > 1) { e.stopPropagation(); e.preventDefault(); }
-  };
-  document.addEventListener('touchstart', _blockMulti, { capture: true, passive: false });
-  document.addEventListener('touchmove',  _blockMulti, { capture: true, passive: false });
-
-""" : "\n"
-
-    return """
+private let bridgeJS = """
 (function () {
   'use strict';
-\(blockSection)  // ── Motion / orientation event bridge ─────────────────────────────────────
+
+  // ── Motion / orientation event bridge ──────────────────────────────────────
   var _motionListeners = [];
   var _orientListeners = [];
   var _origAdd    = window.addEventListener.bind(window);
@@ -383,4 +310,3 @@ private func makeBridgeJS(blockMultiTouch: Bool) -> String {
 
 })();
 """
-}

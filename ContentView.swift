@@ -2,46 +2,26 @@
 
 import SwiftUI
 
-// MARK: - GestureAxis
-
-private enum GestureAxis { case horizontal, vertical }
-
 // MARK: - ContentView
 
 struct ContentView: View {
 
-    // ── Store ──────────────────────────────────────────────────────────────────
-
     @StateObject private var store = VibeStore()
 
-    // ── Vertical feed state ───────────────────────────────────────────────────
+    // ── Feed state ─────────────────────────────────────────────────────────────
+    @State private var currentIndex  = 0
+    @State private var isInteractive = false   // double-tap → full-screen mode
 
-    @State private var currentIndex    = 0
-    @State private var displayIndex    = 0
-    @State private var targetIndex: Int? = nil
-    @State private var dragOffset: CGFloat = 0
-    @State private var isTransitioning = false
+    // ── Vertical browsing ──────────────────────────────────────────────────────
+    @State private var dragY: CGFloat = 0
+    @State private var isBrowsing    = false
 
-    // ── Horizontal nav state ──────────────────────────────────────────────────
-    // horizontalOffset == 0       → feed visible
-    // horizontalOffset == -width  → account panel visible (left swipe)
-
+    // ── Horizontal nav (feed ↔ account) ───────────────────────────────────────
+    // 0 = feed visible   -width = account visible
     @State private var horizontalOffset: CGFloat = 0
 
-    // ── Unified gesture state ─────────────────────────────────────────────────
-
-    @State private var gestureAxis: GestureAxis? = nil
-    @State private var panBaseH: CGFloat = 0
-
-    // ── Overlay state ──────────────────────────────────────────────────────────
-
-    @State private var overlayVisible = true
-    @State private var overlayHideTask: Task<Void, Never>?
-
-    // ── "Vibed." toast ────────────────────────────────────────────────────────
-
-    @State private var showVibedToast = false
-    @State private var toastTask: Task<Void, Never>?
+    // ── Gesture axis lock ──────────────────────────────────────────────────────
+    @State private var lockedAxis: Axis? = nil
 
     // MARK: - Body
 
@@ -50,303 +30,247 @@ struct ContentView: View {
             ZStack {
                 Color.black
 
-                // ── Account panel (left) ───────────────────────────────────
+                // ── Account panel ──────────────────────────────────────────────
                 AccountView()
                     .environmentObject(store)
                     .offset(x: horizontalOffset + geo.size.width)
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 10)
-                            .onChanged { value in
-                                if gestureAxis == nil {
-                                    panBaseH = horizontalOffset
+                    // Swipe right to close account
+                    .gesture(
+                        DragGesture(minimumDistance: 20)
+                            .onChanged { v in
+                                let dx = v.translation.width
+                                if dx > 0 {
+                                    horizontalOffset = max(-geo.size.width, min(0, -geo.size.width + dx))
                                 }
-                                handleDrag(
-                                    CGPoint(x: value.translation.width,
-                                            y: value.translation.height),
-                                    size: geo.size
-                                )
                             }
-                            .onEnded { value in
-                                handleDragEnd(
-                                    CGPoint(x: value.velocity.width,
-                                            y: value.velocity.height),
-                                    size: geo.size
-                                )
+                            .onEnded { v in
+                                let threshold = geo.size.width * 0.3
+                                let fast = v.velocity.width > 500
+                                withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
+                                    horizontalOffset = (v.translation.width > threshold || fast) ? 0 : -geo.size.width
+                                }
                             }
                     )
 
-                // ── Feed panel ─────────────────────────────────────────────
+                // ── Feed panel ─────────────────────────────────────────────────
                 ZStack {
                     vibeStack(size: geo.size)
 
-                    feedOverlay(safeBottom: geo.safeAreaInsets.bottom)
-                        .opacity(overlayVisible ? 1 : 0)
-                        .animation(.easeInOut(duration: 0.4), value: overlayVisible)
+                    if !isInteractive {
+                        // Transparent layer that owns gestures in view mode
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .gesture(browseAndAccountGesture(geo: geo))
+                            .onTapGesture(count: 2) {
+                                withAnimation(.easeInOut(duration: 0.22)) {
+                                    isInteractive = true
+                                }
+                            }
+
+                        viewModeFooter(
+                            vibe: store.vibes[currentIndex],
+                            safeBottom: geo.safeAreaInsets.bottom
+                        )
                         .allowsHitTesting(false)
+                    }
+
+                    // Back button — bottom-left, white 60% opacity
+                    if isInteractive {
+                        VStack {
+                            Spacer()
+                            HStack {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.22)) {
+                                        isInteractive = false
+                                    }
+                                } label: {
+                                    Image(systemName: "chevron.left")
+                                        .font(.system(size: 17, weight: .semibold))
+                                        .foregroundStyle(.white.opacity(0.6))
+                                        .frame(width: 44, height: 44)
+                                        .background(.white.opacity(0.15), in: Circle())
+                                }
+                                Spacer()
+                            }
+                            .padding(.leading, 22)
+                            .padding(.bottom, geo.safeAreaInsets.bottom + 22)
+                        }
+                        .transition(.opacity)
+                    }
                 }
                 .offset(x: horizontalOffset)
-
-                // ── "Vibed." toast ─────────────────────────────────────────
-                if showVibedToast {
-                    Text("Vibed.")
-                        .font(.system(size: 22, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 30)
-                        .padding(.vertical, 15)
-                        .background(.black.opacity(0.72), in: Capsule())
-                        .overlay(Capsule().stroke(.white.opacity(0.2), lineWidth: 1))
-                        .transition(.opacity.combined(with: .scale(scale: 0.88)))
-                        .allowsHitTesting(false)
-                }
             }
             .clipped()
-            .onAppear {
-                scheduleOverlayHide()
-            }
-            .onChange(of: store.vibes.count) { oldCount, newCount in
-                let newIndex = newCount - 1
-                currentIndex   = newIndex
-                displayIndex   = newIndex
-                targetIndex    = nil
-                dragOffset     = 0
-                withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
-                    horizontalOffset = 0
-                }
-                presentToast()
-            }
         }
         .ignoresSafeArea()
+        .animation(.easeInOut(duration: 0.2), value: isInteractive)
     }
 
     // MARK: - Vibe stack
 
     @ViewBuilder
     private func vibeStack(size: CGSize) -> some View {
-        if let ti = targetIndex {
-            let sign: CGFloat = ti > currentIndex ? 1 : -1
-            VibeRenderer(vibe: store.vibes[ti])
+        // Previous
+        if currentIndex > 0 {
+            VibeRenderer(vibe: store.vibes[currentIndex - 1], isInteractive: false)
                 .ignoresSafeArea()
-                .offset(y: sign * size.height + dragOffset)
+                .offset(y: -size.height + dragY)
         }
 
-        VibeRenderer(
-            vibe: store.vibes[currentIndex],
-            onDragBegan: {
-                panBaseH    = horizontalOffset
-                gestureAxis = nil
-            },
-            onDragChanged: { pt in handleDrag(pt, size: size) },
-            onDragEnded:   { pt in handleDragEnd(pt, size: size) }
-        )
-        .ignoresSafeArea()
-        .offset(y: dragOffset)
-    }
+        // Current
+        VibeRenderer(vibe: store.vibes[currentIndex], isInteractive: isInteractive)
+            .ignoresSafeArea()
+            .offset(y: dragY)
 
-    // MARK: - Unified gesture handler
-
-    private func handleDrag(_ pt: CGPoint, size: CGSize) {
-        guard !isTransitioning else { return }
-
-        if gestureAxis == nil {
-            let ax = abs(pt.x), ay = abs(pt.y)
-            guard ax > 20 || ay > 20 else { return }
-            gestureAxis = ax > ay * 1.5 ? .horizontal : .vertical
-        }
-
-        switch gestureAxis! {
-        case .horizontal:
-            handleHorizontalDrag(dx: pt.x, width: size.width)
-        case .vertical:
-            showOverlay()
-            handleVerticalDrag(dy: pt.y, height: size.height)
+        // Next
+        if currentIndex < store.vibes.count - 1 {
+            VibeRenderer(vibe: store.vibes[currentIndex + 1], isInteractive: false)
+                .ignoresSafeArea()
+                .offset(y: size.height + dragY)
         }
     }
 
-    private func handleDragEnd(_ pt: CGPoint, size: CGSize) {
-        defer { gestureAxis = nil }
-        guard !isTransitioning else { return }
+    // MARK: - Gestures
 
-        switch gestureAxis {
-        case .horizontal: commitHorizontal(velocity: pt.x, width: size.width)
-        case .vertical:   commitVertical(velocity: pt.y, height: size.height)
-        case nil:         snapBackVertical()
-        }
+    private func browseAndAccountGesture(geo: GeometryProxy) -> some Gesture {
+        DragGesture(minimumDistance: 15)
+            .onChanged { v in
+                if lockedAxis == nil {
+                    let ax = abs(v.translation.width)
+                    let ay = abs(v.translation.height)
+                    guard ax > 15 || ay > 15 else { return }
+                    lockedAxis = ax > ay * 1.4 ? .horizontal : .vertical
+                }
+
+                switch lockedAxis {
+                case .horizontal:
+                    // Only left swipe opens account
+                    let dx = v.translation.width
+                    if dx < 0 {
+                        horizontalOffset = max(-geo.size.width, dx)
+                    }
+                case .vertical:
+                    handleVerticalDrag(dy: v.translation.height, height: geo.size.height)
+                case nil:
+                    break
+                }
+            }
+            .onEnded { v in
+                defer { lockedAxis = nil }
+                switch lockedAxis {
+                case .horizontal:
+                    commitHorizontal(velocity: v.velocity.width, width: geo.size.width)
+                case .vertical:
+                    commitVertical(velocity: v.velocity.height, height: geo.size.height)
+                case nil:
+                    snapBackVertical()
+                }
+            }
     }
 
-    // MARK: Horizontal (feed ↔ account)
-
-    private func handleHorizontalDrag(dx: CGFloat, width: CGFloat) {
-        if panBaseH < 0 {
-            // In account: rightward closes, leftward rubber-bands
-            let target = panBaseH + dx
-            horizontalOffset = max(-width, min(0, target))
-        } else {
-            // In feed: only leftward drag opens account
-            horizontalOffset = max(-width, min(0, dx))
-        }
-    }
+    // MARK: Horizontal
 
     private func commitHorizontal(velocity: CGFloat, width: CGFloat) {
-        let moved     = abs(horizontalOffset - panBaseH)
-        let threshold = width * 0.3
-        let fast      = abs(velocity) > 600
-
-        let snapTarget: CGFloat
-        if panBaseH < 0 {
-            let close = (moved > threshold || fast) && velocity > 0
-            snapTarget = close ? 0 : -width
-        } else {
-            if (fast && velocity < 0) || horizontalOffset < -threshold {
-                snapTarget = -width
-            } else {
-                snapTarget = 0
-            }
-        }
-
+        let moved = abs(horizontalOffset)
+        let open  = moved > width * 0.3 || velocity < -500
         withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
-            horizontalOffset = snapTarget
+            horizontalOffset = open ? -width : 0
         }
     }
 
-    // MARK: Vertical (feed navigation)
+    // MARK: Vertical
 
     private func handleVerticalDrag(dy: CGFloat, height: CGFloat) {
+        guard !isBrowsing else { return }
         if dy < 0, currentIndex < store.vibes.count - 1 {
-            targetIndex = currentIndex + 1
-            dragOffset  = dy
+            dragY = dy
         } else if dy > 0, currentIndex > 0 {
-            targetIndex = currentIndex - 1
-            dragOffset  = dy
+            dragY = dy
         } else {
-            targetIndex = nil
-            dragOffset  = dy / 3.5
+            dragY = dy / 3.5   // rubber-band at edges
         }
     }
 
     private func commitVertical(velocity: CGFloat, height: CGFloat) {
-        let pastThreshold = abs(dragOffset) > height * 0.3
-        let fastFlick     = abs(velocity)   > 600
+        guard !isBrowsing else { return }
+        let past  = abs(dragY) > height * 0.3
+        let flick = abs(velocity) > 600
 
-        let goNext = (pastThreshold || fastFlick) && dragOffset < 0 && currentIndex < store.vibes.count - 1
-        let goPrev = (pastThreshold || fastFlick) && dragOffset > 0 && currentIndex > 0
-
-        if      goNext { commitVerticalTransition(to: currentIndex + 1, height: height) }
-        else if goPrev { commitVerticalTransition(to: currentIndex - 1, height: height) }
-        else           { snapBackVertical() }
+        if dragY < 0, (past || flick), currentIndex < store.vibes.count - 1 {
+            navigateTo(currentIndex + 1, direction: -height)
+        } else if dragY > 0, (past || flick), currentIndex > 0 {
+            navigateTo(currentIndex - 1, direction: height)
+        } else {
+            snapBackVertical()
+        }
     }
 
-    private func commitVerticalTransition(to newIndex: Int, height: CGFloat) {
-        isTransitioning = true
-        displayIndex    = newIndex
-
-        let endOffset: CGFloat = newIndex > currentIndex ? -height : height
+    private func navigateTo(_ newIndex: Int, direction endY: CGFloat) {
+        isBrowsing = true
         withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
-            dragOffset = endOffset
+            dragY = endY
         }
-
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(420))
-            currentIndex    = newIndex
-            targetIndex     = nil
-            dragOffset      = 0
-            isTransitioning = false
+            currentIndex = newIndex
+            dragY        = 0
+            isBrowsing   = false
         }
-
-        scheduleOverlayHide()
     }
 
     private func snapBackVertical() {
         withAnimation(.interpolatingSpring(stiffness: 300, damping: 30)) {
-            dragOffset = 0
-        }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
-            targetIndex = nil
+            dragY = 0
         }
     }
 
-    // MARK: - Overlay visibility
-
-    private func showOverlay() {
-        overlayHideTask?.cancel()
-        overlayVisible = true
-        scheduleOverlayHide()
-    }
-
-    private func scheduleOverlayHide() {
-        overlayHideTask?.cancel()
-        overlayHideTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
-            overlayVisible = false
-        }
-    }
-
-    // MARK: - Toast
-
-    private func presentToast() {
-        toastTask?.cancel()
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-            showVibedToast = true
-        }
-        toastTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(2.5))
-            withAnimation(.easeOut(duration: 0.4)) {
-                showVibedToast = false
-            }
-        }
-    }
-
-    // MARK: - Feed overlay UI
+    // MARK: - Footer (view mode)
 
     @ViewBuilder
-    private func feedOverlay(safeBottom: CGFloat) -> some View {
-        let vibe = store.vibes[displayIndex]
-
+    private func viewModeFooter(vibe: Vibe, safeBottom: CGFloat) -> some View {
         VStack(spacing: 0) {
             Spacer()
 
             ZStack(alignment: .bottom) {
                 LinearGradient(
-                    colors: [.clear, Color.black.opacity(0.62)],
+                    colors: [.clear, .black.opacity(0.72)],
                     startPoint: .top,
                     endPoint: .bottom
                 )
-                .frame(height: 140)
+                .frame(height: 160)
 
-                HStack(alignment: .bottom, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(vibe.title)
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.45), radius: 3, x: 0, y: 1)
-                        if !vibe.description.isEmpty {
-                            Text(vibe.description)
-                                .font(.system(size: 12, weight: .regular))
-                                .foregroundStyle(.white.opacity(0.72))
-                                .lineLimit(1)
-                                .shadow(color: .black.opacity(0.45), radius: 3, x: 0, y: 1)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(vibe.title)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.4), radius: 3, x: 0, y: 1)
+
+                    HStack(alignment: .center, spacing: 0) {
+                        Text("Vibed")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.55))
+
+                        Text("  ·  ")
+                            .foregroundStyle(.white.opacity(0.3))
+                            .font(.system(size: 12))
+
+                        Text(vibe.createdAt, style: .relative)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.45))
+
+                        Spacer()
+
+                        HStack(spacing: 5) {
+                            Image(systemName: "hand.tap")
+                                .font(.system(size: 11, weight: .medium))
+                            Text("Double tap to interact")
+                                .font(.system(size: 11, weight: .medium))
                         }
-                    }
-
-                    Spacer()
-
-                    // Position dots
-                    HStack(spacing: 5) {
-                        ForEach(store.vibes.indices, id: \.self) { i in
-                            Capsule()
-                                .fill(i == displayIndex
-                                      ? Color.white
-                                      : Color.white.opacity(0.38))
-                                .frame(width: i == displayIndex ? 20 : 6, height: 6)
-                                .animation(
-                                    .spring(response: 0.28, dampingFraction: 0.72),
-                                    value: displayIndex
-                                )
-                        }
+                        .foregroundStyle(.white.opacity(0.45))
                     }
                 }
                 .padding(.horizontal, 18)
-                .padding(.bottom, safeBottom + 14)
+                .padding(.bottom, safeBottom + 16)
             }
         }
     }
