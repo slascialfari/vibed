@@ -23,25 +23,20 @@ struct ContentView: View {
     @State private var isTransitioning = false
 
     // ── Horizontal nav state ──────────────────────────────────────────────────
-    // horizontalOffset == 0        → feed visible
-    // horizontalOffset == width    → editor visible
+    // horizontalOffset == 0       → feed visible
+    // horizontalOffset == -width  → account panel visible (left swipe)
 
     @State private var horizontalOffset: CGFloat = 0
 
     // ── Unified gesture state ─────────────────────────────────────────────────
 
     @State private var gestureAxis: GestureAxis? = nil
-    @State private var panBaseH: CGFloat = 0    // horizontalOffset at gesture start
+    @State private var panBaseH: CGFloat = 0
 
     // ── Overlay state ──────────────────────────────────────────────────────────
 
     @State private var overlayVisible = true
     @State private var overlayHideTask: Task<Void, Never>?
-
-    // ── Swipe hint ─────────────────────────────────────────────────────────────
-
-    @State private var showSwipeHint = true
-    @State private var hintDotPhase  = false
 
     // ── "Vibed." toast ────────────────────────────────────────────────────────
 
@@ -55,7 +50,7 @@ struct ContentView: View {
             ZStack {
                 Color.black
 
-                // ── Account panel ──────────────────────────────────────────
+                // ── Account panel (left) ───────────────────────────────────
                 AccountView()
                     .environmentObject(store)
                     .offset(x: horizontalOffset + geo.size.width)
@@ -88,23 +83,8 @@ struct ContentView: View {
                         .opacity(overlayVisible ? 1 : 0)
                         .animation(.easeInOut(duration: 0.4), value: overlayVisible)
                         .allowsHitTesting(false)
-
-                    swipeHint
-                        .allowsHitTesting(false)
                 }
                 .offset(x: horizontalOffset)
-
-                // ── Editor panel ───────────────────────────────────────────
-                EditorGestureContainer(
-                    onDragBegan: {
-                        panBaseH   = horizontalOffset
-                        gestureAxis = nil
-                    },
-                    onDragChanged: { pt in handleDrag(pt, size: geo.size) },
-                    onDragEnded:   { pt in handleDragEnd(pt, size: geo.size) }
-                )
-                .environmentObject(store)
-                .offset(x: horizontalOffset - geo.size.width)
 
                 // ── "Vibed." toast ─────────────────────────────────────────
                 if showVibedToast {
@@ -122,10 +102,8 @@ struct ContentView: View {
             .clipped()
             .onAppear {
                 scheduleOverlayHide()
-                scheduleHintDismiss()
             }
             .onChange(of: store.vibes.count) { oldCount, newCount in
-                // A new vibe was published — jump to it and close editor
                 let newIndex = newCount - 1
                 currentIndex   = newIndex
                 displayIndex   = newIndex
@@ -169,10 +147,6 @@ struct ContentView: View {
     private func handleDrag(_ pt: CGPoint, size: CGSize) {
         guard !isTransitioning else { return }
 
-        // Wait for at least 20 pts of movement in any direction, then commit to
-        // whichever axis dominates. The prior guard-on-both-axes approach could
-        // deadlock (neither condition passing) and let vertical lock too eagerly
-        // during an intentional horizontal swipe.
         if gestureAxis == nil {
             let ax = abs(pt.x), ay = abs(pt.y)
             guard ax > 20 || ay > 20 else { return }
@@ -182,10 +156,8 @@ struct ContentView: View {
         switch gestureAxis! {
         case .horizontal:
             handleHorizontalDrag(dx: pt.x, width: size.width)
-
         case .vertical:
             showOverlay()
-            dismissHint()
             handleVerticalDrag(dy: pt.y, height: size.height)
         }
     }
@@ -195,30 +167,22 @@ struct ContentView: View {
         guard !isTransitioning else { return }
 
         switch gestureAxis {
-        case .horizontal:
-            commitHorizontal(velocity: pt.x, width: size.width)
-        case .vertical:
-            commitVertical(velocity: pt.y, height: size.height)
-        case nil:
-            // No axis locked — snap everything back
-            snapBackVertical()
+        case .horizontal: commitHorizontal(velocity: pt.x, width: size.width)
+        case .vertical:   commitVertical(velocity: pt.y, height: size.height)
+        case nil:         snapBackVertical()
         }
     }
 
-    // MARK: Horizontal (feed ↔ editor)
+    // MARK: Horizontal (feed ↔ account)
 
     private func handleHorizontalDrag(dx: CGFloat, width: CGFloat) {
-        if panBaseH > 0 {
-            // In editor: leftward drag closes, rightward rubber-bands
-            let target = panBaseH + dx
-            horizontalOffset = min(width, max(0, target))
-        } else if panBaseH < 0 {
-            // In account: rightward drag closes, leftward rubber-bands
+        if panBaseH < 0 {
+            // In account: rightward closes, leftward rubber-bands
             let target = panBaseH + dx
             horizontalOffset = max(-width, min(0, target))
         } else {
-            // In feed: either direction opens panels
-            horizontalOffset = max(-width, min(width, dx))
+            // In feed: only leftward drag opens account
+            horizontalOffset = max(-width, min(0, dx))
         }
     }
 
@@ -228,17 +192,12 @@ struct ContentView: View {
         let fast      = abs(velocity) > 600
 
         let snapTarget: CGFloat
-        if panBaseH > 0 {
-            let close = (moved > threshold || fast) && velocity < 0
-            snapTarget = close ? 0 : width
-        } else if panBaseH < 0 {
+        if panBaseH < 0 {
             let close = (moved > threshold || fast) && velocity > 0
             snapTarget = close ? 0 : -width
         } else {
-            if fast {
-                snapTarget = velocity > 0 ? width : -width
-            } else if abs(horizontalOffset) > threshold {
-                snapTarget = horizontalOffset > 0 ? width : -width
+            if (fast && velocity < 0) || horizontalOffset < -threshold {
+                snapTarget = -width
             } else {
                 snapTarget = 0
             }
@@ -279,7 +238,6 @@ struct ContentView: View {
     private func commitVerticalTransition(to newIndex: Int, height: CGFloat) {
         isTransitioning = true
         displayIndex    = newIndex
-        dismissHint()
 
         let endOffset: CGFloat = newIndex > currentIndex ? -height : height
         withAnimation(.interpolatingSpring(stiffness: 260, damping: 28)) {
@@ -320,96 +278,6 @@ struct ContentView: View {
         overlayHideTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             overlayVisible = false
-        }
-    }
-
-    // MARK: - Swipe hint
-
-    private func dismissHint() {
-        guard showSwipeHint else { return }
-        withAnimation(.easeOut(duration: 0.35)) { showSwipeHint = false }
-    }
-
-    private func scheduleHintDismiss() {
-        withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-            hintDotPhase = true
-        }
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(5))
-            withAnimation(.easeOut(duration: 0.5)) { showSwipeHint = false }
-        }
-    }
-
-    @ViewBuilder
-    private var swipeHint: some View {
-        if showSwipeHint {
-            VStack(spacing: 16) {
-                // ── Vertical hint ──────────────────────────────────────────
-                HStack(spacing: 10) {
-                    HStack(spacing: 5) {
-                        ForEach(0..<2, id: \.self) { i in
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .offset(y: hintDotPhase ? -3 : 3)
-                                .animation(
-                                    .easeInOut(duration: 0.6)
-                                        .repeatForever(autoreverses: true)
-                                        .delay(Double(i) * 0.15),
-                                    value: hintDotPhase
-                                )
-                        }
-                    }
-                    Text("Explore vibes")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.9))
-                }
-
-                Rectangle()
-                    .fill(.white.opacity(0.12))
-                    .frame(height: 1)
-                    .padding(.horizontal, 4)
-
-                // ── Horizontal hint ────────────────────────────────────────
-                HStack(spacing: 14) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "arrow.left")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .offset(x: hintDotPhase ? -3 : 3)
-                            .animation(
-                                .easeInOut(duration: 0.6)
-                                    .repeatForever(autoreverses: true),
-                                value: hintDotPhase
-                            )
-                        Text("Your account")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-
-                    Spacer()
-
-                    HStack(spacing: 10) {
-                        Image(systemName: "arrow.right")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .offset(x: hintDotPhase ? 3 : -3)
-                            .animation(
-                                .easeInOut(duration: 0.6)
-                                    .repeatForever(autoreverses: true),
-                                value: hintDotPhase
-                            )
-                        Text("Create a vibe")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 18)
-            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.15), lineWidth: 1))
-            .transition(.opacity.combined(with: .scale(scale: 0.88)))
         }
     }
 

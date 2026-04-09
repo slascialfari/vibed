@@ -6,7 +6,6 @@ struct EditorView: View {
 
     @EnvironmentObject private var store: VibeStore
 
-    @State private var selectedTab = 0
     @State private var title       = ""
     @State private var code        = ""
     @State private var hasPreviewed = false
@@ -25,89 +24,74 @@ struct EditorView: View {
         ZStack {
             Color(white: 0.06).ignoresSafeArea()
 
-            TabView(selection: $selectedTab) {
-                AICreatorView(previewVibe: $previewVibe) { vibe in
-                    store.publish(vibe)
-                    previewVibe = nil
-                }
-                .tabItem {
-                    Label("Create with AI", systemImage: "wand.and.stars")
-                }
-                .tag(0)
+            VStack(spacing: 0) {
+                TextField("Name your vibe...", text: $title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .tint(.white)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 64)
+                    .padding(.bottom, 14)
 
-                VStack(spacing: 0) {
-                    TextField("Name your vibe...", text: $title)
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .tint(.white)
-                        .padding(.horizontal, 20)
-                        .padding(.top, 64)
-                        .padding(.bottom, 14)
+                Divider()
+                    .background(Color.white.opacity(0.1))
 
-                    Divider()
-                        .background(Color.white.opacity(0.1))
+                TextEditor(text: $code)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .tint(.white)
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
 
-                    TextEditor(text: $code)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .tint(.white)
-                        .scrollContentBackground(.hidden)
-                        .background(Color.clear)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 6)
+                Divider()
+                    .background(Color.white.opacity(0.1))
 
-                    Divider()
-                        .background(Color.white.opacity(0.1))
-
-                    HStack(spacing: 12) {
-                        Button {
-                            previewVibe = Vibe(title: resolvedTitle,
-                                              description: "",
-                                              htmlContent: code)
-                            hasPreviewed = true
-                        } label: {
-                            Text("Preview")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(codeIsEmpty
-                                                 ? Color.white.opacity(0.3)
-                                                 : Color.white)
-                                .padding(.horizontal, 28)
-                                .padding(.vertical, 13)
-                                .background(
-                                    Color.white.opacity(codeIsEmpty ? 0.04 : 0.1),
-                                    in: Capsule()
-                                )
-                                .overlay(
-                                    Capsule()
-                                        .stroke(Color.white.opacity(codeIsEmpty ? 0.08 : 0.18),
-                                                lineWidth: 1)
-                                )
-                        }
-                        .disabled(codeIsEmpty)
-
-                        Button {
-                            store.publish(Vibe(title: resolvedTitle,
-                                              description: "",
-                                              htmlContent: code))
-                        } label: {
-                            Text("Publish")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(!hasPreviewed ? Color.black.opacity(0.4) : Color.black)
-                                .padding(.horizontal, 28)
-                                .padding(.vertical, 13)
-                                .background(
-                                    Color.white.opacity(!hasPreviewed ? 0.35 : 1),
-                                    in: Capsule()
-                                )
-                        }
-                        .disabled(!hasPreviewed)
+                HStack(spacing: 12) {
+                    Button {
+                        previewVibe = Vibe(title: resolvedTitle,
+                                          description: "",
+                                          htmlContent: code)
+                        hasPreviewed = true
+                    } label: {
+                        Text("Preview")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(codeIsEmpty
+                                             ? Color.white.opacity(0.3)
+                                             : Color.white)
+                            .padding(.horizontal, 28)
+                            .padding(.vertical, 13)
+                            .background(
+                                Color.white.opacity(codeIsEmpty ? 0.04 : 0.1),
+                                in: Capsule()
+                            )
+                            .overlay(
+                                Capsule()
+                                    .stroke(Color.white.opacity(codeIsEmpty ? 0.08 : 0.18),
+                                            lineWidth: 1)
+                            )
                     }
-                    .padding(20)
+                    .disabled(codeIsEmpty)
+
+                    Button {
+                        store.publish(Vibe(title: resolvedTitle,
+                                          description: "",
+                                          htmlContent: code))
+                    } label: {
+                        Text("Publish")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(!hasPreviewed ? Color.black.opacity(0.4) : Color.black)
+                            .padding(.horizontal, 28)
+                            .padding(.vertical, 13)
+                            .background(
+                                Color.white.opacity(!hasPreviewed ? 0.35 : 1),
+                                in: Capsule()
+                            )
+                    }
+                    .disabled(!hasPreviewed)
                 }
-                .tabItem {
-                    Label("Paste Code", systemImage: "doc.text")
-                }
-                .tag(1)
+                .padding(20)
             }
 
             if let vibe = previewVibe {
