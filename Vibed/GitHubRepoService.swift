@@ -27,42 +27,40 @@ struct GitHubRepo: Identifiable, Decodable {
 // MARK: - GitHubRepoService
 
 /// Downloads GitHub repos as ZIP archives, extracts them, and serves index.html URLs.
-/// Results are cached on disk (1-hour TTL) and in memory.
+/// Cache is invalidated when the repo's pushed_at timestamp changes on GitHub.
 actor GitHubRepoService {
 
     static let shared = GitHubRepoService()
 
     private var urlCache: [String: URL] = [:]   // "owner/repo" → local index.html URL
-    private let cacheTTL: TimeInterval = 3600   // 1 hour
 
     // MARK: - Public API
 
     /// Returns a local file:// URL pointing to index.html inside the extracted repo.
-    /// Reads from disk/memory cache if fresh; downloads and extracts otherwise.
+    /// Re-downloads only if the repo's pushed_at has changed since last cache.
     func fetchRepoContents(owner: String, repo: String, token: String?) async throws -> URL {
         let key = "\(owner)/\(repo)"
+        let cacheDir = Self.cacheDir(owner: owner, repo: repo)
+        let pushedAtFile = cacheDir.appendingPathComponent(".pushed_at")
 
-        // 1. In-memory cache hit
-        if let cached = urlCache[key] {
+        // 1. Fetch current pushed_at from GitHub
+        let remotePushedAt = try await fetchPushedAt(owner: owner, repo: repo, token: token)
+
+        // 2. Check if cache is still valid
+        let cachedPushedAt = try? String(contentsOf: pushedAtFile, encoding: .utf8)
+        if cachedPushedAt == remotePushedAt,
+           let cached = urlCache[key] ?? Self.findIndexHTML(in: cacheDir) {
+            urlCache[key] = cached
             return cached
         }
 
-        // 2. Filesystem cache hit (fresh within TTL)
-        let cacheDir = Self.cacheDir(owner: owner, repo: repo)
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: cacheDir.path),
-           let created = attrs[.creationDate] as? Date,
-           Date().timeIntervalSince(created) < cacheTTL,
-           let indexURL = Self.findIndexHTML(in: cacheDir) {
-            urlCache[key] = indexURL
-            return indexURL
-        }
-
-        // 3. Download + extract
+        // 3. Cache is stale or missing — download + extract
         let tempZip = try await downloadZipball(owner: owner, repo: repo, token: token)
 
         try? FileManager.default.removeItem(at: cacheDir)
         try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         try FileManager.default.unzipItem(at: tempZip, to: cacheDir)
+        try remotePushedAt.write(to: pushedAtFile, atomically: true, encoding: .utf8)
 
         guard let indexURL = Self.findIndexHTML(in: cacheDir) else {
             throw GitHubRepoError.noIndexHTML(repo)
@@ -82,6 +80,18 @@ actor GitHubRepoService {
     }
 
     // MARK: - Private helpers
+
+    private func fetchPushedAt(owner: String, repo: String, token: String?) async throws -> String {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(owner)/\(repo)")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pushedAt = json["pushed_at"] as? String else {
+            throw GitHubRepoError.downloadFailed(repo)
+        }
+        return pushedAt
+    }
 
     private func downloadZipball(owner: String, repo: String, token: String?) async throws -> URL {
         for branch in ["main", "master"] {
