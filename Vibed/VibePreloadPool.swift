@@ -25,6 +25,7 @@ final class VibePreloadPool: ObservableObject {
         let webView: WKWebView
         let nav: SlotNav   // strong ref — webView holds only weak refs to delegates
         let msg: SlotMsg
+        let handler: VibedSchemeHandler
     }
 
     private var slots: [Int: Slot] = [:]
@@ -54,9 +55,9 @@ final class VibePreloadPool: ObservableObject {
     /// Called when navigating away from a slot. Silently reloads the content
     /// off-screen so the vibe is fresh and ready for the next visit.
     func resetSlot(index: Int, vibe: Vibe) {
-        guard let wv = slots[index]?.webView else { return }
-        wv.alpha = 0
-        loadContent(into: wv, vibe: vibe)
+        guard let slot = slots[index] else { return }
+        slot.webView.alpha = 0
+        loadContent(into: slot.webView, vibe: vibe, handler: slot.handler)
     }
 
     // MARK: - Private: slot lifecycle
@@ -67,9 +68,7 @@ final class VibePreloadPool: ObservableObject {
         slotVibeIDs[index] = vibe.id
 
         if let cachedURL = fileURLCache[vibe.id] {
-            // Already have a local URL (from a previous download this session)
-            slot.webView.loadFileURL(cachedURL,
-                                     allowingReadAccessTo: cachedURL.deletingLastPathComponent())
+            loadRepoURL(cachedURL, into: slot)
         } else if let repoName = vibe.githubRepoName {
             // GitHub-backed vibe: download in background
             startDownload(for: vibe, repoName: repoName, into: slot, at: index)
@@ -101,8 +100,7 @@ final class VibePreloadPool: ObservableObject {
 
                 // Only load into the webView if this slot is still live for this vibe
                 if let currentSlot = slots[index], currentSlot.webView === slot.webView {
-                    slot.webView.loadFileURL(url,
-                                             allowingReadAccessTo: url.deletingLastPathComponent())
+                    loadRepoURL(url, into: slot)
                 }
             } catch {
                 downloadingIDs.remove(vibe.id)
@@ -110,9 +108,19 @@ final class VibePreloadPool: ObservableObject {
         }
     }
 
-    private func loadContent(into wv: WKWebView, vibe: Vibe) {
+    private func loadRepoURL(_ url: URL, into slot: Slot) {
+        slot.handler.baseDir = url.deletingLastPathComponent()
+        if let html = try? String(contentsOf: url, encoding: .utf8) {
+            slot.webView.loadHTMLString(html, baseURL: URL(string: "vibed://localhost/"))
+        }
+    }
+
+    private func loadContent(into wv: WKWebView, vibe: Vibe, handler: VibedSchemeHandler) {
         if let url = fileURLCache[vibe.id] {
-            wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+            handler.baseDir = url.deletingLastPathComponent()
+            if let html = try? String(contentsOf: url, encoding: .utf8) {
+                wv.loadHTMLString(html, baseURL: URL(string: "vibed://localhost/"))
+            }
         } else if let html = vibe.htmlContent {
             wv.loadHTMLString(html, baseURL: nil)
         }
@@ -122,12 +130,14 @@ final class VibePreloadPool: ObservableObject {
 
     private func makeSlot() -> Slot {
         let msg = SlotMsg()
+        let handler = VibedSchemeHandler()
 
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.allowsAirPlayForMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
+        config.setURLSchemeHandler(handler, forURLScheme: "vibed")
         config.userContentController.addUserScript(
             WKUserScript(source: poolBridgeJS,
                          injectionTime: .atDocumentStart,
@@ -154,7 +164,7 @@ final class VibePreloadPool: ObservableObject {
         wv.navigationDelegate = nav
         wv.uiDelegate = nav
 
-        return Slot(webView: wv, nav: nav, msg: msg)
+        return Slot(webView: wv, nav: nav, msg: msg, handler: handler)
     }
 
     private func evict(_ index: Int) {
@@ -220,8 +230,12 @@ private final class SlotNav: NSObject, WKNavigationDelegate, WKUIDelegate {
                  decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         let scheme = action.request.url?.scheme?.lowercased()
-        // Allow file:// for local repo assets; block http/https external navigation
-        decisionHandler(scheme == "http" || scheme == "https" ? .cancel : .allow)
+        guard scheme == "http" || scheme == "https" else {
+            decisionHandler(.allow); return
+        }
+        let isUserNavigation = action.navigationType == .linkActivated
+                            || action.navigationType == .formSubmitted
+        decisionHandler(isUserNavigation ? .cancel : .allow)
     }
 
     func webView(_ wv: WKWebView,

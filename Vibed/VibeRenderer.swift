@@ -19,10 +19,14 @@ struct VibeRenderer: UIViewRepresentable {
     /// false → container blocks touches so the SwiftUI gesture layer handles them
     var isInteractive: Bool = false
 
-    func makeCoordinator() -> Coordinator { Coordinator(isInteractive: isInteractive) }
+    /// Optional callback for console messages captured from the WebView.
+    var onLog: ((String) -> Void)? = nil
+
+    func makeCoordinator() -> Coordinator { Coordinator(isInteractive: isInteractive, onLog: onLog) }
 
     func makeUIView(context: Context) -> UIView {
         let config = WKWebViewConfiguration()
+        config.setURLSchemeHandler(context.coordinator.schemeHandler, forURLScheme: "vibed")
 
         // ── Media ────────────────────────────────────────────────────────────
         config.allowsInlineMediaPlayback = true
@@ -36,8 +40,15 @@ struct VibeRenderer: UIViewRepresentable {
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true)
         )
+        config.userContentController.addUserScript(
+            WKUserScript(source: consoleJS,
+                         injectionTime: .atDocumentStart,
+                         forMainFrameOnly: true)
+        )
         let proxy = WeakScriptMessageHandler(coordinator: context.coordinator)
         config.userContentController.add(proxy, name: "haptics")
+        let consoleProxy = WeakConsoleHandler(coordinator: context.coordinator)
+        config.userContentController.add(consoleProxy, name: "_console")
 
         // ── WKWebView ────────────────────────────────────────────────────────
         let wv = WKWebView(frame: .zero, configuration: config)
@@ -67,7 +78,7 @@ struct VibeRenderer: UIViewRepresentable {
         ])
 
         context.coordinator.attach(to: wv)
-        loadContent(into: wv)
+        loadContent(into: wv, schemeHandler: context.coordinator.schemeHandler)
         context.coordinator.loadedKey = loadKey
         return container
     }
@@ -79,7 +90,7 @@ struct VibeRenderer: UIViewRepresentable {
         context.coordinator.loadedKey = loadKey
         // Hide while loading new content; didFinish will fade back in
         context.coordinator.webView?.alpha = 0
-        if let wv = context.coordinator.webView { loadContent(into: wv) }
+        if let wv = context.coordinator.webView { loadContent(into: wv, schemeHandler: context.coordinator.schemeHandler) }
     }
 
     // MARK: - Helpers
@@ -90,10 +101,12 @@ struct VibeRenderer: UIViewRepresentable {
         "\(vibe.id)-\(fileURL?.path ?? "html")"
     }
 
-    private func loadContent(into wv: WKWebView) {
+    private func loadContent(into wv: WKWebView, schemeHandler: VibedSchemeHandler? = nil) {
         if let url = fileURL {
-            // Allow read access to the full repo folder so relative assets work
-            wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+            schemeHandler?.baseDir = url.deletingLastPathComponent()
+            if let html = try? String(contentsOf: url, encoding: .utf8) {
+                wv.loadHTMLString(html, baseURL: URL(string: "vibed://localhost/"))
+            }
         } else if let html = vibe.htmlContent {
             wv.loadHTMLString(html, baseURL: nil)
         }
@@ -104,6 +117,8 @@ struct VibeRenderer: UIViewRepresentable {
         coordinator.tearDown()
         coordinator.webView?.configuration.userContentController
             .removeScriptMessageHandler(forName: "haptics")
+        coordinator.webView?.configuration.userContentController
+            .removeScriptMessageHandler(forName: "_console")
     }
 }
 
@@ -118,9 +133,12 @@ final class Coordinator: NSObject,
     private(set) weak var webView: WKWebView?
     private let motion = CMMotionManager()
     private let isInteractive: Bool
+    let onLog: ((String) -> Void)?
+    let schemeHandler = VibedSchemeHandler()
 
-    init(isInteractive: Bool) {
+    init(isInteractive: Bool, onLog: ((String) -> Void)? = nil) {
         self.isInteractive = isInteractive
+        self.onLog = onLog
     }
 
     func attach(to wv: WKWebView) {
@@ -236,7 +254,15 @@ final class Coordinator: NSObject,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         let scheme = navigationAction.request.url?.scheme?.lowercased()
-        decisionHandler(scheme == "http" || scheme == "https" ? .cancel : .allow)
+        guard scheme == "http" || scheme == "https" else {
+            decisionHandler(.allow)
+            return
+        }
+        // Only block user-triggered link navigations away from the content.
+        // Allow subresource loads (CDN scripts, ES module fetches via importmap, fetch/XHR).
+        let isUserNavigation = navigationAction.navigationType == .linkActivated
+                            || navigationAction.navigationType == .formSubmitted
+        decisionHandler(isUserNavigation ? .cancel : .allow)
     }
 
     // MARK: WKUIDelegate — camera & microphone
@@ -256,6 +282,25 @@ final class Coordinator: NSObject,
 
 protocol VibeHapticsHandler: AnyObject {
     func handleHapticMessage(_ body: [String: Any])
+}
+
+private final class WeakConsoleHandler: NSObject, WKScriptMessageHandler {
+    private weak var coordinator: Coordinator?
+    init(coordinator: Coordinator) { self.coordinator = coordinator }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard let body = message.body as? [String: Any],
+              let level = body["level"] as? String,
+              let text  = body["message"] as? String else { return }
+        let icon = level == "error" ? "🔴" : level == "warn" ? "🟡" : "⚪️"
+        let entry = "\(icon) [\(level)] \(text)"
+        DispatchQueue.main.async { [weak self] in
+            self?.coordinator?.onLog?(entry)
+        }
+    }
 }
 
 private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
@@ -348,5 +393,103 @@ private let bridgeJS = """
     writable: false
   });
 
+})();
+"""
+
+// MARK: - VibedSchemeHandler
+
+/// Serves local repo files over the custom `vibed://` scheme so that
+/// JavaScript fetch() and XHR can load relative assets (GLB, images, etc.)
+/// without hitting WKWebView's file:// fetch restriction.
+final class VibedSchemeHandler: NSObject, WKURLSchemeHandler {
+    var baseDir: URL?
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        guard let base = baseDir, let requestURL = task.request.url else {
+            respond404(task); return
+        }
+        // Strip leading "/" from the path component to get the relative filename
+        let rel = requestURL.path.hasPrefix("/") ? String(requestURL.path.dropFirst()) : requestURL.path
+        let file = rel.isEmpty ? base.appendingPathComponent("index.html") : base.appendingPathComponent(rel)
+
+        guard let data = try? Data(contentsOf: file) else { respond404(task); return }
+
+        let mime = Self.mime(for: file.pathExtension)
+        let headers = ["Content-Type": mime,
+                       "Content-Length": "\(data.count)",
+                       "Access-Control-Allow-Origin": "*"]
+        let response = HTTPURLResponse(url: requestURL, statusCode: 200,
+                                       httpVersion: "HTTP/1.1", headerFields: headers)!
+        task.didReceive(response)
+        task.didReceive(data)
+        task.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+
+    private func respond404(_ task: WKURLSchemeTask) {
+        let url = task.request.url ?? URL(string: "vibed://localhost/")!
+        let response = HTTPURLResponse(url: url, statusCode: 404,
+                                       httpVersion: nil, headerFields: nil)!
+        task.didReceive(response)
+        task.didFinish()
+    }
+
+    static func mime(for ext: String) -> String {
+        switch ext.lowercased() {
+        case "html":        return "text/html; charset=utf-8"
+        case "js", "mjs":  return "application/javascript"
+        case "css":         return "text/css"
+        case "glb":         return "model/gltf-binary"
+        case "gltf":        return "model/gltf+json"
+        case "bin":         return "application/octet-stream"
+        case "png":         return "image/png"
+        case "jpg","jpeg":  return "image/jpeg"
+        case "webp":        return "image/webp"
+        case "gif":         return "image/gif"
+        case "svg":         return "image/svg+xml"
+        case "wasm":        return "application/wasm"
+        case "json":        return "application/json"
+        default:            return "application/octet-stream"
+        }
+    }
+}
+
+// MARK: - Console capture JS
+
+private let consoleJS = """
+(function () {
+  var _h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers._console;
+  function _serialize(a) {
+    try {
+      if (a === null) return 'null';
+      if (typeof a !== 'object') return String(a);
+      // Error / ErrorEvent — message + stack
+      if (typeof a.message === 'string') {
+        var s = a.message;
+        if (a.stack) s += '\\n' + a.stack;
+        return s;
+      }
+      // ProgressEvent (xhr load errors)
+      if (a.type) return '[' + a.type + ' event on ' + (a.target && a.target.responseURL || a.target) + ']';
+      return JSON.stringify(a);
+    } catch (_) { return '[unserializable]'; }
+  }
+  function _post(level, args) {
+    if (!_h) return;
+    var msg = Array.prototype.slice.call(args).map(_serialize).join(' ');
+    try { _h.postMessage({ level: level, message: msg }); } catch (_) {}
+  }
+  ['log', 'info', 'warn', 'error'].forEach(function (level) {
+    var orig = console[level].bind(console);
+    console[level] = function () { _post(level, arguments); orig.apply(console, arguments); };
+  });
+  window.addEventListener('error', function (e) {
+    _post('error', ['[JS Error] ' + e.message + ' (' + (e.filename || '') + ':' + e.lineno + ')']);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    var reason = e.reason ? (e.reason.message || String(e.reason)) : 'unknown rejection';
+    _post('error', ['[Promise] ' + reason]);
+  });
 })();
 """
